@@ -13,8 +13,11 @@ describe("normalizeSearchQuery", () => {
   it("maps the standalone digit 2 to 'to'", () => {
     expect(normalizeSearchQuery("jpg 2 png")).toBe("jpg to png");
   });
-  it("splits joined compact forms jpg2png", () => {
+  it("splits joined compact forms jpg2png and mp42mp3", () => {
     expect(normalizeSearchQuery("jpg2png")).toBe("jpg to png");
+    expect(normalizeSearchQuery("mp42mp3")).toBe("mp4 to mp3");
+    expect(normalizeSearchQuery("mp32wav")).toBe("mp3 to wav");
+    expect(normalizeSearchQuery("m4a2mp3")).toBe("m4a to mp3");
   });
   it("splits jpgtopng", () => {
     expect(normalizeSearchQuery("jpgtopng")).toBe("jpg to png");
@@ -29,10 +32,13 @@ describe("normalizeSearchQuery", () => {
     expect(normalizeSearchQuery("convert mp4 to mp3 file online")).toBe("mp4 to mp3");
   });
 
-  // #1327: the joined-form split fired on any word with "to" inside it.
-  it.each(["vectorize", "customize", "histogram", "photograph"])("leaves %j whole", (word) => {
-    expect(normalizeSearchQuery(word)).toBe(word);
-  });
+  // #1327, #1366: the joined-form split fired on any word with "to" or "2" inside it.
+  it.each(["vectorize", "customize", "histogram", "photograph", "h2o", "a2b"])(
+    "leaves %j whole",
+    (word) => {
+      expect(normalizeSearchQuery(word)).toBe(word);
+    },
+  );
 
   it("only splits a joined form between whole format tokens", () => {
     expect(normalizeSearchQuery("xjpgtopng")).toBe("xjpgtopng");
@@ -50,7 +56,7 @@ describe("normalizeSearchQuery", () => {
     let checked = 0;
     for (const preset of CONVERSION_PRESETS) {
       for (const kw of generateConversionKeywords({ from: preset.from, to: preset.to })) {
-        const joined = /^([a-z0-9]+)to([a-z0-9]+)$/.exec(kw);
+        const joined = /^([a-z0-9]+)(?:to|2)([a-z0-9]+)$/.exec(kw);
         if (!joined) continue;
         checked++;
         expect(normalizeSearchQuery(kw), `${preset.id}: ${kw}`).toBe(
@@ -68,6 +74,9 @@ describe("normalizeSearchQuery", () => {
     expect(ids.length).toBeGreaterThan(20);
     for (const [id, from, to] of ids) {
       expect(normalizeSearchQuery(`${from}to${to}`), id).toBe(
+        normalizeSearchQuery(`${from} to ${to}`),
+      );
+      expect(normalizeSearchQuery(`${from}2${to}`), id).toBe(
         normalizeSearchQuery(`${from} to ${to}`),
       );
     }

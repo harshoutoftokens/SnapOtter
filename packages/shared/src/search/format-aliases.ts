@@ -60,6 +60,10 @@ const JOINED_CONVERSION = new RegExp(
   `(^|[^a-z0-9])${JOINED_FORMAT}to${JOINED_FORMAT}(?![a-z0-9])`,
   "g",
 );
+const JOINED_CONVERSION_DIGIT = new RegExp(
+  `(^|[^a-z0-9])${JOINED_FORMAT}2${JOINED_FORMAT}(?![a-z0-9])`,
+  "g",
+);
 
 /** Words that name a whole modality, too broad to search on their own. */
 const BARE_MODALITY_WORDS = new Set([
@@ -94,8 +98,8 @@ const FILLER = new Set([
  */
 export function normalizeSearchQuery(raw: string): string {
   let s = raw.toLowerCase().trim();
-  // Split alpha/digit boundaries so "jpg2png" -> "jpg 2 png", "mp4" stays intact only at word edges.
-  s = s.replace(/([a-z])2([a-z])/g, "$1 to $2");
+  // "jpg2png", "mp42mp3" -> "jpg to png", "mp4 to mp3", only between known formats (#1366).
+  s = s.replace(JOINED_CONVERSION_DIGIT, "$1$2 to $3");
   // "jpgtopng" -> "jpg to png", only between known formats.
   s = s.replace(JOINED_CONVERSION, "$1$2 to $3");
   // Collapse separators to spaces.
