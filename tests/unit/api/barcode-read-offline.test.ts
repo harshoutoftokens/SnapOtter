@@ -8,6 +8,27 @@ const { purgeZXingModule, readBarcodes } = await import(
   new URL("../../../apps/api/node_modules/zxing-wasm/dist/es/reader/index.js", import.meta.url).href
 );
 
+async function decodeQrFixture() {
+  const buf = readFixture(fixtures.image.code.qrPng);
+  const image = sharp(buf);
+  const meta = await image.metadata();
+  const rawData = await image.ensureAlpha().raw().toBuffer();
+
+  const imageData = {
+    data: new Uint8ClampedArray(rawData.buffer, rawData.byteOffset, rawData.length),
+    width: meta.width ?? 0,
+    height: meta.height ?? 0,
+  } as ImageData;
+
+  return readBarcodes(imageData);
+}
+
+function blockFetch() {
+  return vi.spyOn(globalThis, "fetch").mockImplementation(() => {
+    throw new Error("Network request blocked in offline environment");
+  });
+}
+
 describe("barcode-read offline wasm loading (#1385)", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -15,7 +36,7 @@ describe("barcode-read offline wasm loading (#1385)", () => {
     initZXingReader();
   });
 
-  it("verifies unconfigured zxing-wasm attempts remote fetch to jsdelivr CDN", async () => {
+  it("verifies unconfigured zxing-wasm attempts a remote fetch", async () => {
     purgeZXingModule();
 
     let fetchedUrl = "";
@@ -31,32 +52,29 @@ describe("barcode-read offline wasm loading (#1385)", () => {
     } as ImageData;
 
     await expect(readBarcodes(dummyImg)).rejects.toThrow();
-    expect(fetchedUrl).toContain("fastly.jsdelivr.net/npm/zxing-wasm");
+    expect(fetchedUrl).toMatch(/^https?:\/\/.*zxing_reader\.wasm$/);
   });
 
-  it("decodes barcodes when fetch throws (100% offline via route initZXingReader)", async () => {
+  it("configures the local wasm when the route module is imported", async () => {
     purgeZXingModule();
 
-    // Initialize via production route helper
+    // Re-evaluate the route so only its module-scope setup can configure zxing.
+    vi.resetModules();
+    await import("../../../apps/api/src/routes/tools/barcode-read.js");
+
+    const fetchSpy = blockFetch();
+    const results = await decodeQrFixture();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(results[0]?.text).toBe("https://snapotter.com");
+  });
+
+  it("decodes barcodes with fetch blocked after initZXingReader", async () => {
+    purgeZXingModule();
     initZXingReader();
 
-    // Stub global fetch to fail unconditionally if any network call is attempted
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(() => {
-      throw new Error("Network request blocked in offline environment");
-    });
-
-    const buf = readFixture(fixtures.image.code.qrPng);
-    const image = sharp(buf);
-    const meta = await image.metadata();
-    const rawData = await image.ensureAlpha().raw().toBuffer();
-
-    const imageData = {
-      data: new Uint8ClampedArray(rawData.buffer, rawData.byteOffset, rawData.length),
-      width: meta.width ?? 0,
-      height: meta.height ?? 0,
-    } as ImageData;
-
-    const results = await readBarcodes(imageData);
+    const fetchSpy = blockFetch();
+    const results = await decodeQrFixture();
 
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(results.length).toBeGreaterThan(0);

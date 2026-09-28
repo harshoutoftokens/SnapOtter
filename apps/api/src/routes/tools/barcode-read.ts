@@ -16,14 +16,19 @@ import { decompressSvgz, sanitizeSvg } from "../../lib/svg-sanitize.js";
 
 export function initZXingReader(): void {
   const require = createRequire(import.meta.url);
-  prepareZXingModule({
-    overrides: {
-      wasmBinary: readFileSync(require.resolve("zxing-wasm/reader/zxing_reader.wasm")),
-    },
-  });
+  let wasmBinary: Buffer;
+  try {
+    wasmBinary = readFileSync(require.resolve("zxing-wasm/reader/zxing_reader.wasm"));
+  } catch (err) {
+    throw new Error(
+      "barcode-read: could not load the bundled zxing_reader.wasm; reinstall dependencies",
+      { cause: err },
+    );
+  }
+  prepareZXingModule({ overrides: { wasmBinary } });
 }
 
-// Ensure WebAssembly binary is pre-loaded from local package on module initialization
+// Hand zxing-wasm the packaged binary so it never fetches it from jsdelivr (#1385).
 initZXingReader();
 
 const settingsSchema = z.object({
