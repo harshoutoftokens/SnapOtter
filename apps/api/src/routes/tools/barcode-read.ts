@@ -14,12 +14,17 @@ import { decodeHeic } from "../../lib/heic-converter.js";
 import { putObject } from "../../lib/object-storage.js";
 import { decompressSvgz, sanitizeSvg } from "../../lib/svg-sanitize.js";
 
-const require = createRequire(import.meta.url);
-prepareZXingModule({
-  overrides: {
-    wasmBinary: readFileSync(require.resolve("zxing-wasm/reader/zxing_reader.wasm")),
-  },
-});
+export function initZXingReader(): void {
+  const require = createRequire(import.meta.url);
+  prepareZXingModule({
+    overrides: {
+      wasmBinary: readFileSync(require.resolve("zxing-wasm/reader/zxing_reader.wasm")),
+    },
+  });
+}
+
+// Ensure WebAssembly binary is pre-loaded from local package on module initialization
+initZXingReader();
 
 const settingsSchema = z.object({
   tryHarder: z.boolean().default(true),

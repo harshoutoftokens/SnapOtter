@@ -1,25 +1,18 @@
-import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import sharp from "sharp";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { initZXingReader } from "../../../apps/api/src/routes/tools/barcode-read.js";
 import { fixtures, readFixture } from "../../fixtures/index.js";
 
 // Load ESM zxing-wasm reader module instance
-const { prepareZXingModule, purgeZXingModule, readBarcodes } = await import(
+const { purgeZXingModule, readBarcodes } = await import(
   new URL("../../../apps/api/node_modules/zxing-wasm/dist/es/reader/index.js", import.meta.url).href
-);
-
-// Require resolver anchored at barcode-read route
-const require = createRequire(
-  new URL("../../../apps/api/src/routes/tools/barcode-read.ts", import.meta.url),
 );
 
 describe("barcode-read offline wasm loading (#1385)", () => {
   afterEach(() => {
     vi.restoreAllMocks();
-    // Ensure module is left in configured state with local wasm
-    const wasmBinary = readFileSync(require.resolve("zxing-wasm/reader/zxing_reader.wasm"));
-    prepareZXingModule({ overrides: { wasmBinary } });
+    // Ensure module is left in configured state with local wasm via production helper
+    initZXingReader();
   });
 
   it("verifies unconfigured zxing-wasm attempts remote fetch to jsdelivr CDN", async () => {
@@ -41,12 +34,11 @@ describe("barcode-read offline wasm loading (#1385)", () => {
     expect(fetchedUrl).toContain("fastly.jsdelivr.net/npm/zxing-wasm");
   });
 
-  it("decodes barcodes when fetch throws (100% offline without CDN download)", async () => {
+  it("decodes barcodes when fetch throws (100% offline via route initZXingReader)", async () => {
     purgeZXingModule();
 
-    // Prepare with local wasm as done in apps/api/src/routes/tools/barcode-read.ts
-    const wasmBinary = readFileSync(require.resolve("zxing-wasm/reader/zxing_reader.wasm"));
-    prepareZXingModule({ overrides: { wasmBinary } });
+    // Initialize via production route helper
+    initZXingReader();
 
     // Stub global fetch to fail unconditionally if any network call is attempted
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(() => {
