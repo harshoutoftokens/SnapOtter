@@ -19,6 +19,20 @@ describe("normalizeSearchQuery", () => {
     expect(normalizeSearchQuery("mp32wav")).toBe("mp3 to wav");
     expect(normalizeSearchQuery("m4a2mp3")).toBe("m4a to mp3");
   });
+  // #1388 review: these split under the old letter-2-letter regex, so the
+  // known-format list has to cover them too.
+  it.each([
+    ["yaml2json", "yaml to json"],
+    ["htm2pdf", "htm to pdf"],
+    ["odp2pdf", "odp to pdf"],
+    ["tsv2csv", "tsv to csv"],
+    ["apng2gif", "apng to gif"],
+    ["srt2vtt", "srt to vtt"],
+    ["speech2text", "speech to text"],
+    ["voice2text", "voice to text"],
+  ])("splits %j", (query, expected) => {
+    expect(normalizeSearchQuery(query)).toBe(expected);
+  });
   it("splits jpgtopng", () => {
     expect(normalizeSearchQuery("jpgtopng")).toBe("jpg to png");
   });

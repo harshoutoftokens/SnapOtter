@@ -39,15 +39,21 @@ const JOINABLE_FORMATS = [
     ...Object.keys(FORMAT_ALIASES),
     ...Object.values(FORMAT_ALIASES).flat(),
     // Image and raw formats.
-    ...["avif", "bmp", "eps", "gif", "ico", "jfif", "jxl", "png", "psd", "svg", "tga", "webp"],
+    ...["apng", "avif", "bmp", "eps", "gif", "ico", "jfif", "jxl", "png", "psd", "svg", "svgz"],
+    ...["tga", "webp"],
     ...["arw", "cr2", "dng", "nef", "raw"],
     // Audio and video.
     ...["3gp", "aac", "aiff", "avi", "flac", "flv", "m4a", "mkv", "mov", "mp3", "mp4"],
     ...["ogg", "opus", "wav", "webm", "wma", "wmv"],
+    // Subtitles.
+    ...["srt", "vtt"],
     // Documents and data.
-    ...["csv", "epub", "html", "json", "odt", "pdf", "rtf", "text", "txt", "xml", "zip"],
+    ...["csv", "epub", "htm", "html", "json", "odp", "ods", "odt", "pdf", "rtf", "text", "tsv"],
+    ...["txt", "xml", "yaml", "yml", "zip"],
     // Words from the x-to-y tool ids (html-to-image, video-to-gif, ...).
     ...["base64", "frames", "images", "raster", "video"],
+    // Speech-to-text phrasings ("speech2text", "voice2text").
+    ...["speech", "voice"],
   ]),
 ].sort((a, b) => b.length - a.length);
 
