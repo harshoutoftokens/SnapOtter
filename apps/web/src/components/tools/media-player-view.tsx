@@ -22,13 +22,18 @@ export function MediaPlayerView() {
   // F7: if the browser loaded the container but cannot decode the codec,
   // videoWidth will be 0. Fall back to the server-transcode preview.
   if (!isAudio && unsupportedCodec) {
+    const hasResult = !!entry.processedUrl;
     return (
       <div className="flex h-full w-full items-center justify-center p-4">
         <NonNativePreview
-          file={entry.file}
-          src={src}
-          filename={entry.file?.name ?? "video"}
-          fileSize={entry.file?.size ?? 0}
+          file={hasResult ? undefined : entry.file}
+          src={hasResult ? (entry.processedUrl ?? undefined) : undefined}
+          filename={
+            hasResult
+              ? (entry.processedFilename ?? entry.file?.name ?? "video")
+              : (entry.file?.name ?? "video")
+          }
+          fileSize={hasResult ? (entry.processedSize ?? null) : (entry.file?.size ?? 0)}
           modality="video"
         />
       </div>
