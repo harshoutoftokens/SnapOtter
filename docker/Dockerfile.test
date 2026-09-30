@@ -70,6 +70,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libjxl-tools \
     ghostscript \
     qpdf \
+    python3-venv \
     tesseract-ocr \
     tesseract-ocr-eng tesseract-ocr-deu tesseract-ocr-fra \
     tesseract-ocr-spa tesseract-ocr-chi-sim tesseract-ocr-jpn \
@@ -105,6 +106,23 @@ RUN POLICY_FILE=$(find /etc/ImageMagick* -name policy.xml 2>/dev/null | head -1)
         sed -i "s/<policy domain=\"coder\" rights=\"none\" pattern=\"${CODER}\"/<policy domain=\"coder\" rights=\"read|write\" pattern=\"${CODER}\"/" "$POLICY_FILE"; \
       done; \
     fi
+
+# PyMuPDF for the fitz-gated suites: pdf-to-text, sign/redact/flatten-pdf, the
+# fitz block of docs-dispatcher, and the fitz tools in the generated format and
+# settings matrices. PR CI shards don't install it, so before #1610 they skipped
+# in every lane; this nightly lane is now the one that runs them (the fuzz and
+# FULL_MATRIX runs live in a host job that still lacks it). Pinned to the
+# production image's version. It lives at /app/.venv, the repo-root venv
+# tests/helpers/python-gate.ts and the sidecar bridge try first, rather than
+# /opt/venv plus PYTHON_VENV_PATH: the API reads /opt/venv as the baked base it
+# reseeds AI venvs from and PYTHON_VENV_PATH as the venv bundle installs write
+# into, and the feature tests must not see either one. It sits above the
+# workspace COPYs so a lockfile change doesn't reinstall it, and
+# docker-compose.test.yml sets REQUIRE_PYTHON_FITZ=1 so a venv the suite can't
+# find fails the run instead of skipping it.
+RUN python3 -m venv /app/.venv && \
+    /app/.venv/bin/pip install --no-cache-dir PyMuPDF==1.27.2.3 && \
+    /app/.venv/bin/python -c "import fitz"
 
 WORKDIR /app
 

@@ -11,9 +11,14 @@
  */
 
 import { PassThrough } from "node:stream";
+import { SafeError } from "@snapotter/shared";
 import type { FastifyRequest } from "fastify";
 import { describe, expect, it } from "vitest";
-import { multipartFailure, multipartParts } from "../../../apps/api/src/lib/multipart-parts.js";
+import {
+  multipartFailure,
+  multipartParts,
+  readFilePart,
+} from "../../../apps/api/src/lib/multipart-parts.js";
 
 const BOUNDARY = "----UnitBoundary1234";
 
@@ -175,6 +180,55 @@ describe("multipartParts", () => {
     }).rejects.toThrow("field value too large");
   });
 
+  it.each([
+    [
+      "too many text fields",
+      multipartBody(Array.from({ length: 101 }, (_, i) => ({ name: `f${i}`, content: "x" }))),
+    ],
+    [
+      "a text field over the cap",
+      multipartBody([{ name: "settings", content: Buffer.alloc(1024 * 1024 + 1, 0x61) }]),
+    ],
+    [
+      "more files than MAX_BATCH_SIZE",
+      multipartBody(
+        Array.from({ length: 11 }, (_, i) => ({
+          name: "file",
+          filename: `${i}.bin`,
+          content: "x",
+        })),
+      ),
+    ],
+    ["a body that isn't multipart", Buffer.from("this is not multipart at all")],
+  ])("marks %s as the client's error, a 400 (#1473)", async (_label, body) => {
+    // A bare Error reaches the error handler as a reported 500. These are all
+    // the request's fault, so the status travels with the error.
+    let caught: unknown;
+    try {
+      for await (const part of multipartParts(fakeRequest(body))) {
+        if (part.type === "file") await drain(part.file);
+      }
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).toMatchObject({ statusCode: 400 });
+  });
+
+  it("marks a multipart header with no boundary as a 400 (#1473)", async () => {
+    // A client that sets Content-Type by hand on a FormData body sends this.
+    const raw = new PassThrough();
+    Object.assign(raw, { headers: { "content-type": "multipart/form-data" } });
+    raw.end("anything");
+
+    await expect(async () => {
+      for await (const part of multipartParts({ raw } as unknown as FastifyRequest)) {
+        if (part.type === "file") await drain(part.file);
+      }
+    }).rejects.toMatchObject({ statusCode: 400 });
+  });
+
   it("honors a route-specific two-file limit", async () => {
     const body = multipartBody([
       { name: "index", filename: "ocr-runtime-index.json", content: "index" },
@@ -187,6 +241,107 @@ describe("multipartParts", () => {
         if (part.type === "file") await drain(part.file);
       }
     }).rejects.toThrow("files limit");
+  });
+});
+
+describe("readFilePart (#1473)", () => {
+  it("reads a file part into memory", async () => {
+    const body = multipartBody([{ name: "file", filename: "a.bin", content: "hello" }]);
+    for await (const part of multipartParts(fakeRequest(body))) {
+      if (part.type === "file") expect((await readFilePart(part.file)).toString()).toBe("hello");
+    }
+  });
+
+  it("keeps the 413 of a part over the size limit", async () => {
+    const body = multipartBody([
+      { name: "file", filename: "big.bin", content: Buffer.alloc(4096, 1) },
+    ]);
+    const generator = multipartParts(fakeRequest(body), { fileSize: 1024 });
+    const { value: part } = await generator.next();
+    if (part?.type !== "file") throw new Error("expected a file part");
+
+    await expect(readFilePart(part.file)).rejects.toMatchObject({ statusCode: 413 });
+    await generator.return(undefined);
+  });
+
+  /** A request whose body so far is half of one file part, and the part. */
+  async function halfSentFile() {
+    const raw = new PassThrough();
+    Object.assign(raw, {
+      headers: { "content-type": `multipart/form-data; boundary=${BOUNDARY}` },
+    });
+    raw.write(
+      `--${BOUNDARY}\r\nContent-Disposition: form-data; name="file"; filename="a.bin"\r\n` +
+        "Content-Type: application/octet-stream\r\n\r\npartial content",
+    );
+    const generator = multipartParts({ raw } as unknown as FastifyRequest);
+    const { value: part } = await generator.next();
+    if (part?.type !== "file") throw new Error("expected a file part");
+    return { raw, generator, file: part.file };
+  }
+
+  it("marks a part the body ends in the middle of as a 400", async () => {
+    // The reader is already waiting on the part when the body stops.
+    const { raw, generator, file } = await halfSentFile();
+
+    const reading = readFilePart(file);
+    await sleep(10);
+    raw.end();
+
+    await expect(reading).rejects.toMatchObject({ statusCode: 400 });
+    await generator.return(undefined);
+  });
+
+  it("fails a part the body stopped in even when nothing was reading it yet", async () => {
+    // Busboy reports the cut on itself and ends the part as if it were
+    // complete. Reading it later must fail, not hand back the truncated bytes
+    // as if they were the whole file.
+    const { raw, generator, file } = await halfSentFile();
+    raw.end();
+    await sleep(10);
+
+    await expect(readFilePart(file)).rejects.toMatchObject({ statusCode: 400 });
+    await generator.return(undefined);
+  });
+
+  it("fails the part being read with a 400 when the client drops the connection", async () => {
+    // A dropped connection errors the request stream and never ends it, so
+    // busboy never notices. The reader used to wait on the part forever, and
+    // the upload never got to discard what it had already staged.
+    const { raw, generator, file } = await halfSentFile();
+
+    const reading = readFilePart(file).then(
+      () => "resolved",
+      (err: unknown) => err,
+    );
+    await sleep(10);
+    raw.emit("error", Object.assign(new Error("aborted"), { code: "ECONNRESET" }));
+
+    const outcome = await Promise.race([reading, sleep(1000).then(() => "still waiting")]);
+    expect(outcome).toMatchObject({ statusCode: 400, code: "ECONNRESET" });
+    await generator.return(undefined);
+  });
+
+  it("fails the next part with a 400 when the client drops the connection between parts", async () => {
+    const raw = new PassThrough();
+    Object.assign(raw, {
+      headers: { "content-type": `multipart/form-data; boundary=${BOUNDARY}` },
+    });
+    // A whole field, then the start of the next part: busboy only emits the
+    // field once it sees the boundary after it.
+    raw.write(
+      `--${BOUNDARY}\r\nContent-Disposition: form-data; name="toolId"\r\n\r\nresize\r\n--${BOUNDARY}\r\n`,
+    );
+    const generator = multipartParts({ raw } as unknown as FastifyRequest);
+    expect((await generator.next()).value).toMatchObject({ type: "field", value: "resize" });
+
+    const next = generator.next().then(
+      () => "resolved",
+      (err: unknown) => err,
+    );
+    raw.emit("error", Object.assign(new Error("aborted"), { code: "ECONNRESET" }));
+
+    expect(await next).toMatchObject({ statusCode: 400, code: "ECONNRESET" });
   });
 });
 
@@ -245,5 +400,22 @@ describe("multipartFailure (#1341)", () => {
       status: 400,
       body: { error: "Failed to parse multipart request", details: "boom" },
     });
+  });
+
+  // #1421: a storage fault while the upload streams in (the workspace cap,
+  // the disk floor, a full or read-only volume, an S3 outage) is the server's,
+  // not a malformed request. It goes back to the route's caller unchanged, so
+  // the global error handler answers with its status, message and code, and
+  // reports it.
+  it("rethrows a server-side fault instead of calling it a malformed request", () => {
+    const cap = new SafeError("Workspace storage limit reached", {
+      kind: "operational",
+      code: "workspace-cap",
+      statusCode: 503,
+    });
+    expect(() => multipartFailure(cap)).toThrow(cap);
+
+    const other = Object.assign(new Error("storage exploded"), { statusCode: 500 });
+    expect(() => multipartFailure(other)).toThrow(other);
   });
 });

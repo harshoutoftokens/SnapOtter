@@ -1,5 +1,5 @@
 import { Download, Loader2, PackageOpen } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CollapsibleSection } from "@/components/common/collapsible-section";
 import { useTranslation } from "@/contexts/i18n-context";
 import { formatHeaders } from "@/lib/api";
@@ -8,27 +8,29 @@ import { format } from "@/lib/format";
 import { useFileStore } from "@/stores/file-store";
 import type { SplitMode } from "@/stores/split-store";
 import { useSplitStore } from "@/stores/split-store";
-import { claimToolResult, splitResultKey } from "@/stores/tool-result-claims";
+import {
+  claimToolResult,
+  claimToolResultItem,
+  splitResultKey,
+  splitTileKey,
+} from "@/stores/tool-result-claims";
 
-const MODES: Array<{ id: SplitMode; label: string }> = [
-  { id: "grid", label: "Grid" },
-  { id: "tile-size", label: "Tile Size" },
-];
+const MODES: SplitMode[] = ["grid", "tile-size"];
 
 const PRESETS = [
-  { label: "2x1", c: 2, r: 1, desc: "Horizontal half" },
-  { label: "1x2", c: 1, r: 2, desc: "Vertical half" },
-  { label: "2x2", c: 2, r: 2, desc: "Quarters" },
-  { label: "3x1", c: 3, r: 1, desc: "Horizontal strip" },
-  { label: "1x3", c: 1, r: 3, desc: "Vertical strip" },
-  { label: "3x3", c: 3, r: 3, desc: "9-tile grid" },
-  { label: "2x3", c: 2, r: 3, desc: "6-tile portrait" },
-  { label: "3x2", c: 3, r: 2, desc: "6-tile landscape" },
-  { label: "4x4", c: 4, r: 4, desc: "16-tile grid" },
-];
+  { label: "2x1", c: 2, r: 1, hintId: "horizontalHalf" },
+  { label: "1x2", c: 1, r: 2, hintId: "verticalHalf" },
+  { label: "2x2", c: 2, r: 2, hintId: "quarters" },
+  { label: "3x1", c: 3, r: 1, hintId: "horizontalStrip" },
+  { label: "1x3", c: 1, r: 3, hintId: "verticalStrip" },
+  { label: "3x3", c: 3, r: 3, hintId: "grid9" },
+  { label: "2x3", c: 2, r: 3, hintId: "portrait6" },
+  { label: "3x2", c: 3, r: 2, hintId: "landscape6" },
+  { label: "4x4", c: 4, r: 4, hintId: "grid16" },
+] as const;
 
 const OUTPUT_FORMATS = [
-  { value: "original", label: "Keep Original" },
+  { value: "original" },
   { value: "png", label: "PNG" },
   { value: "jpg", label: "JPG" },
   { value: "webp", label: "WebP" },
@@ -71,6 +73,9 @@ export function SplitSettings() {
   } = useSplitStore();
 
   const [downloadingIndex, setDownloadingIndex] = useState<number | null>(null);
+  const downloadingTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  useEffect(() => () => clearTimeout(downloadingTimer.current), []);
 
   const hasFile = files.length > 0;
   const grid = getEffectiveGrid();
@@ -135,7 +140,12 @@ export function SplitSettings() {
         });
         if (!res.ok) {
           const text = await res.text();
-          throw new Error(`Failed to split ${file.name}: ${text || res.status}`);
+          throw new Error(
+            format(t.toolSettings.split.failedToSplit, {
+              name: file.name,
+              detail: text || res.status,
+            }),
+          );
         }
 
         const blob = await res.blob();
@@ -176,9 +186,10 @@ export function SplitSettings() {
           height: 0,
           blobUrl: t.blobUrl,
         })),
+        files.length,
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Split failed");
+      setError(err instanceof Error ? err.message : t.toolSettings.split.splitFailed);
     } finally {
       setProcessing(false);
     }
@@ -194,6 +205,7 @@ export function SplitSettings() {
     setError,
     setTiles,
     setZipBlobUrl,
+    t,
   ]);
 
   const handleDownloadZip = useCallback(() => {
@@ -219,13 +231,12 @@ export function SplitSettings() {
         outputFormat === "original" ? (files[0]?.name?.split(".").pop() ?? "png") : outputFormat;
       a.download = `${baseName}_r${tile.row}_c${tile.col}.${ext}`;
       a.click();
-      setTimeout(() => setDownloadingIndex(null), 500);
-      // Deliberately claims nothing. One tile is not the set, and the claim is
-      // per tool, so claiming here would drop the warning for the tiles the
-      // user never took. Tracking which tiles have been taken is the right
-      // answer; warning about a tile already downloaded is the safe
-      // approximation until then, because silence is the costlier way to be
-      // wrong.
+      clearTimeout(downloadingTimer.current);
+      downloadingTimer.current = setTimeout(() => setDownloadingIndex(null), 500);
+      // This tile only. The guard goes quiet once every tile of the run has
+      // been taken, and never on a multi-file run, whose other files' tiles
+      // are only in the zip (splitTileKeys, runFileCount).
+      claimToolResultItem("split", splitTileKey(tile));
     },
     [tiles, files, outputFormat],
   );
@@ -237,16 +248,16 @@ export function SplitSettings() {
         <div className="flex gap-1">
           {MODES.map((m) => (
             <button
-              key={m.id}
+              key={m}
               type="button"
-              onClick={() => setMode(m.id)}
+              onClick={() => setMode(m)}
               className={`flex-1 text-xs px-3 py-1.5 rounded-lg transition-colors ${
-                mode === m.id
+                mode === m
                   ? "bg-primary text-primary-foreground"
                   : "bg-muted text-muted-foreground hover:text-foreground"
               }`}
             >
-              {m.label}
+              {m === "grid" ? t.toolSettings.split.modeGrid : t.toolSettings.split.modeTileSize}
             </button>
           ))}
         </div>
@@ -262,7 +273,7 @@ export function SplitSettings() {
                   key={p.label}
                   type="button"
                   onClick={() => applyPreset(p.c, p.r)}
-                  title={p.desc}
+                  title={t.toolSettings.split.presetHints[p.hintId]}
                   className={`text-xs px-2 py-1.5 rounded-lg transition-colors ${
                     columns === p.c && rows === p.r
                       ? "bg-primary text-primary-foreground"
@@ -379,7 +390,7 @@ export function SplitSettings() {
 
       <CollapsibleSection
         title={t.toolSettings.split.outputFormat}
-        badge={outputFormat === "original" ? "Auto" : outputFormat.toUpperCase()}
+        badge={outputFormat === "original" ? t.toolSettings.split.auto : outputFormat.toUpperCase()}
       >
         <div className="space-y-3 pt-1">
           <div className="grid grid-cols-2 gap-1">
@@ -394,7 +405,7 @@ export function SplitSettings() {
                     : "bg-muted text-muted-foreground hover:text-foreground"
                 }`}
               >
-                {f.label}
+                {"label" in f ? f.label : t.toolSettings.split.keepOriginal}
               </button>
             ))}
           </div>

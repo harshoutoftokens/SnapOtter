@@ -11,7 +11,8 @@
  */
 import { randomUUID } from "node:crypto";
 import { extname } from "node:path";
-import { and, desc, eq, inArray, like, sql } from "drizzle-orm";
+import { SafeError } from "@snapotter/shared";
+import { and, desc, eq, inArray, isNotNull, like, sql } from "drizzle-orm";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import sharp from "sharp";
 import { z } from "zod";
@@ -38,6 +39,7 @@ import {
 } from "../lib/format-decoders.js";
 import { decodeHeic } from "../lib/heic-converter.js";
 import { deleteLibraryFileStorage } from "../lib/library-cleanup.js";
+import { readFilePart } from "../lib/multipart-parts.js";
 import { isSvgBuffer, sanitizeSvg } from "../lib/svg-sanitize.js";
 import { engineUnavailable } from "../modality/image-input.js";
 import { pdfFirstPagePreview, videoPosterPreview } from "../modality/preview.js";
@@ -89,6 +91,19 @@ function extToMime(ext: string): string {
 }
 
 /**
+ * The MIME type to store for a file that didn't validate as an image, given
+ * the type it claims (the client's part header, or one read off its name).
+ *
+ * Only validateImageBuffer() can vouch for an image type, so an image/* claim
+ * for bytes that failed it becomes application/octet-stream (#1349). Any other
+ * claim is kept: video, audio, PDF and Office files have no sniff here, and
+ * their previews branch on that type.
+ */
+function unverifiedMime(claimedMime: string): string {
+  return claimedMime.startsWith("image/") ? "application/octet-stream" : claimedMime;
+}
+
+/**
  * The width/height to store for a validated image, or null if they weren't
  * actually measured.
  *
@@ -125,14 +140,26 @@ function serializeFile(row: typeof schema.userFiles.$inferSelect) {
 }
 
 /**
- * Check whether a user (and their team) has exceeded their storage quota.
- * Uses the pre-computed storageUsed counter on the users table.
- * Throws with statusCode 413 if the quota is exceeded.
+ * Why storing `additionalBytes` more would put the user, or their team, over
+ * quota: the message for a 413, or null when it fits. Uses the pre-computed
+ * storageUsed counters. A database fault throws rather than reading as "over
+ * quota", so the caller answers a reported 500 instead of a 413 nobody looks
+ * into (#1473).
+ *
+ * `lock` is for the transaction that charges the bytes: it locks the user's
+ * row, and the team's row when the team has a quota, before reading. A
+ * concurrent upload by the same user or a teammate then waits here until this
+ * one commits and sees its charge, so two uploads that each fit can't both
+ * land over the limit. NO KEY UPDATE is enough for that and, unlike UPDATE,
+ * doesn't hold up inserts elsewhere that reference the user.
  */
-async function checkStorageQuota(userId: string | null, additionalBytes = 0): Promise<void> {
-  if (!userId) return;
-
-  const [user] = await db
+async function quotaRefusal(
+  conn: Pick<typeof db, "select">,
+  userId: string,
+  additionalBytes: number,
+  lock = false,
+): Promise<string | null> {
+  const userQuery = conn
     .select({
       storageUsed: schema.users.storageUsed,
       storageQuota: schema.users.storageQuota,
@@ -141,8 +168,9 @@ async function checkStorageQuota(userId: string | null, additionalBytes = 0): Pr
     .from(schema.users)
     .where(eq(schema.users.id, userId))
     .limit(1);
+  const [user] = lock ? await userQuery.for("no key update") : await userQuery;
 
-  if (!user) return;
+  if (!user) return null;
   const { storageUsed, storageQuota, team } = user;
 
   // Per-user quota: user-level override, then env fallback
@@ -150,23 +178,21 @@ async function checkStorageQuota(userId: string | null, additionalBytes = 0): Pr
     storageQuota ??
     (env.MAX_STORAGE_PER_USER_MB > 0 ? env.MAX_STORAGE_PER_USER_MB * 1024 * 1024 : 0);
   if (userLimit > 0 && storageUsed + additionalBytes > userLimit) {
-    const error = new Error(
-      `Storage quota exceeded. Used ${((storageUsed + additionalBytes) / (1024 * 1024)).toFixed(1)}MB of ${(userLimit / (1024 * 1024)).toFixed(1)}MB`,
-    );
-    (error as Error & { statusCode: number }).statusCode = 413;
-    throw error;
+    return `Storage quota exceeded. Used ${((storageUsed + additionalBytes) / (1024 * 1024)).toFixed(1)}MB of ${(userLimit / (1024 * 1024)).toFixed(1)}MB`;
   }
 
-  // Per-team quota
+  // Per-team quota. Only a team with a quota is locked: every upload on the
+  // instance would otherwise queue on the Default team's row.
   if (team) {
-    const [teamRow] = await db
+    const teamQuery = conn
       .select({ storageQuota: schema.teams.storageQuota })
       .from(schema.teams)
-      .where(eq(schema.teams.id, team))
+      .where(and(eq(schema.teams.id, team), isNotNull(schema.teams.storageQuota)))
       .limit(1);
+    const [teamRow] = lock ? await teamQuery.for("no key update") : await teamQuery;
 
     if (teamRow?.storageQuota) {
-      const [teamUsed] = await db
+      const [teamUsed] = await conn
         .select({
           total: sql<number>`coalesce(sum(${schema.users.storageUsed}), 0)`,
         })
@@ -175,14 +201,11 @@ async function checkStorageQuota(userId: string | null, additionalBytes = 0): Pr
 
       const teamTotal = Number(teamUsed.total);
       if (teamTotal + additionalBytes > teamRow.storageQuota) {
-        const error = new Error(
-          `Team storage quota exceeded. Team used ${((teamTotal + additionalBytes) / (1024 * 1024)).toFixed(1)}MB of ${(teamRow.storageQuota / (1024 * 1024)).toFixed(1)}MB`,
-        );
-        (error as Error & { statusCode: number }).statusCode = 413;
-        throw error;
+        return `Team storage quota exceeded. Team used ${((teamTotal + additionalBytes) / (1024 * 1024)).toFixed(1)}MB of ${(teamRow.storageQuota / (1024 * 1024)).toFixed(1)}MB`;
       }
     }
   }
+  return null;
 }
 
 // ── Route registration ─────────────────────────────────────────────
@@ -260,8 +283,10 @@ export async function userFileRoutes(app: FastifyInstance): Promise<void> {
   /**
    * POST /api/v1/files/upload
    *
-   * Multipart form with one or more image file parts.
-   * Validates each (magic bytes + dimensions), stores to disk, creates DB record.
+   * Multipart form with one or more file parts. Each is checked as an image
+   * (magic bytes + dimensions); one that passes is stored with its sniffed
+   * type, one that doesn't is still kept, under a type from
+   * unverifiedMime(). Stores to disk, creates DB record.
    */
   app.post(
     "/api/v1/files/upload",
@@ -271,13 +296,9 @@ export async function userFileRoutes(app: FastifyInstance): Promise<void> {
       if (!user) return;
       const userId = user.id;
 
-      // Enforce per-user storage quota before accepting uploads
-      try {
-        await checkStorageQuota(userId);
-      } catch (err) {
-        const statusCode = (err as Error & { statusCode?: number }).statusCode ?? 413;
-        return reply.status(statusCode).send({ error: (err as Error).message });
-      }
+      // Refuse an account already over quota before reading the body.
+      const overQuota = await quotaRefusal(db, userId, 0);
+      if (overQuota) return reply.status(413).send({ error: overQuota });
 
       // All-or-nothing (#1342): every part is validated, quota-checked against
       // the whole batch, and written to storage first. Only once every part
@@ -286,12 +307,30 @@ export async function userFileRoutes(app: FastifyInstance): Promise<void> {
       // error response always means nothing was saved.
       const staged: { storedName: string; values: typeof schema.userFiles.$inferInsert }[] = [];
       let stagedBytes = 0;
+      // The request has already failed and no row points at a staged blob, so
+      // one this can't delete is orphaned for good: report it, don't just warn
+      // (#1472). It's wrapped so orphans group on their own in Sentry, and so
+      // an S3 connection reset isn't taken for this client hanging up. The
+      // client still gets the refusal that caused the discard.
       const discardStaged = async () => {
         await Promise.all(
           staged.map(({ storedName }) =>
-            deleteStoredFile(storedName).catch((err) =>
-              request.log.warn({ err, storedName }, "Failed to discard a staged upload"),
-            ),
+            deleteStoredFile(storedName).catch((err) => {
+              request.log.error({ err, storedName }, "Failed to discard a staged upload");
+              void reportError(
+                new SafeError("Could not discard a staged upload", {
+                  kind: "operational",
+                  code: "STAGED_DISCARD_FAILED",
+                  cause: err,
+                }),
+                {
+                  source: "http",
+                  route: "/api/v1/files/upload",
+                  method: "POST",
+                  subsystem: "upload-storage",
+                },
+              );
+            }),
           ),
         );
       };
@@ -311,12 +350,7 @@ export async function userFileRoutes(app: FastifyInstance): Promise<void> {
           }
           if (part.type !== "file") continue;
 
-          // Consume the stream into a buffer
-          const chunks: Buffer[] = [];
-          for await (const chunk of part.file) {
-            chunks.push(chunk);
-          }
-          const buffer = Buffer.concat(chunks);
+          const buffer = await readFilePart(part.file);
 
           if (buffer.length === 0) continue;
 
@@ -354,19 +388,18 @@ export async function userFileRoutes(app: FastifyInstance): Promise<void> {
           }
 
           // Quota is checked against the whole batch so far, not this file alone:
-          // nothing is charged until the commit below.
-          try {
-            await checkStorageQuota(userId, stagedBytes + safeBuffer.length);
-          } catch (err) {
+          // nothing is charged until the commit below, which checks again under
+          // a lock. This one stops reading as soon as the batch can't fit.
+          const batchOverQuota = await quotaRefusal(db, userId, stagedBytes + safeBuffer.length);
+          if (batchOverQuota) {
             await discardStaged();
-            const statusCode = (err as Error & { statusCode?: number }).statusCode ?? 413;
-            return reply.status(statusCode).send({ error: (err as Error).message });
+            return reply.status(413).send({ error: batchOverQuota });
           }
 
           const safeName = sanitizeFilename(part.filename ?? "upload");
           const mimeType = isValidImage
             ? formatToMime(validation.format)
-            : part.mimetype || "application/octet-stream";
+            : unverifiedMime(part.mimetype || "application/octet-stream");
           const dimensions = measuredDimensions(isValidImage ? validation : null);
 
           const storedName = await saveFile(safeBuffer, safeName);
@@ -389,10 +422,12 @@ export async function userFileRoutes(app: FastifyInstance): Promise<void> {
           });
         }
       } catch (err) {
-        // A part that failed mid-read (over the upload limit, a dropped
-        // connection) or a storage write that threw: undo the batch, then let
-        // the error handler answer with the error's own status (413 for the
-        // size limit, #1280).
+        // A request the parser rejected (over the upload limit, too many
+        // files, a body cut off mid-part), a quota lookup or a storage write
+        // that threw: undo the batch, then let the error handler answer with
+        // the error's own status. Parser failures carry theirs (413 for the
+        // size limit, #1280; 400 otherwise, #1473); a database or storage
+        // fault has none and answers a reported 500.
         await discardStaged();
         throw err;
       }
@@ -401,20 +436,23 @@ export async function userFileRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(400).send({ error: "No valid files uploaded" });
       }
 
-      let rows: (typeof schema.userFiles.$inferSelect)[];
+      let committed: { rows: (typeof schema.userFiles.$inferSelect)[] } | { overQuota: string };
       try {
-        rows = await db.transaction(async (tx) => {
+        committed = await db.transaction(async (tx) => {
+          // The checks above ran before anything was charged, so a concurrent
+          // upload could have passed them too (#1473). This one holds the
+          // locks through the charge, so only uploads that still fit land.
+          const overQuota = await quotaRefusal(tx, userId, stagedBytes, true);
+          if (overQuota) return { overQuota };
           const inserted = await tx
             .insert(schema.userFiles)
             .values(staged.map((s) => s.values))
             .returning();
-          if (userId) {
-            await tx
-              .update(schema.users)
-              .set({ storageUsed: sql`${schema.users.storageUsed} + ${stagedBytes}` })
-              .where(eq(schema.users.id, userId));
-          }
-          return inserted;
+          await tx
+            .update(schema.users)
+            .set({ storageUsed: sql`${schema.users.storageUsed} + ${stagedBytes}` })
+            .where(eq(schema.users.id, userId));
+          return { rows: inserted };
         });
       } catch (err) {
         // user_files has no unique constraint, so this isn't a conflict: it's a
@@ -426,8 +464,12 @@ export async function userFileRoutes(app: FastifyInstance): Promise<void> {
         await discardStaged();
         throw err;
       }
+      if ("overQuota" in committed) {
+        await discardStaged();
+        return reply.status(413).send({ error: committed.overQuota });
+      }
       // Keep the response in upload order; RETURNING doesn't promise one.
-      const byId = new Map(rows.map((r) => [r.id, r]));
+      const byId = new Map(committed.rows.map((r) => [r.id, r]));
       const created = staged.flatMap((s) => {
         const row = byId.get(s.values.id as string);
         return row ? [serializeFile(row)] : [];
@@ -828,12 +870,8 @@ export async function userFileRoutes(app: FastifyInstance): Promise<void> {
     const userId = user.id;
 
     // Enforce per-user storage quota before saving results
-    try {
-      await checkStorageQuota(userId);
-    } catch (err) {
-      const statusCode = (err as Error & { statusCode?: number }).statusCode ?? 413;
-      return reply.status(statusCode).send({ error: (err as Error).message });
-    }
+    const overQuota = await quotaRefusal(db, userId, 0);
+    if (overQuota) return reply.status(413).send({ error: overQuota });
 
     let fileBuffer: Buffer | null = null;
     let filename = "result";
@@ -843,11 +881,7 @@ export async function userFileRoutes(app: FastifyInstance): Promise<void> {
     const parts = request.parts();
     for await (const part of parts) {
       if (part.type === "file") {
-        const chunks: Buffer[] = [];
-        for await (const chunk of part.file) {
-          chunks.push(chunk);
-        }
-        fileBuffer = Buffer.concat(chunks);
+        fileBuffer = await readFilePart(part.file);
         filename = sanitizeFilename(part.filename ?? "result");
       } else if (part.fieldname === "parentId") {
         parentId = (part.value as string).trim() || null;
@@ -896,19 +930,17 @@ export async function userFileRoutes(app: FastifyInstance): Promise<void> {
     const baseName = parent.originalName.replace(/\.[^.]+$/, "");
     const resultName = `${baseName}${ext}`;
 
-    const mimeType = isValidImage ? formatToMime(validation.format) : extToMime(ext);
+    const mimeType = isValidImage
+      ? formatToMime(validation.format)
+      : unverifiedMime(extToMime(ext));
     const dimensions = measuredDimensions(isValidImage ? validation : null);
 
     // Sanitize SVG results to prevent XXE, SSRF, and script injection
     const safeResultBuffer = isSvgBuffer(fileBuffer) ? sanitizeSvg(fileBuffer) : fileBuffer;
 
     // Re-check quota with actual file size before persisting
-    try {
-      await checkStorageQuota(userId, safeResultBuffer.length);
-    } catch (err) {
-      const statusCode = (err as Error & { statusCode?: number }).statusCode ?? 413;
-      return reply.status(statusCode).send({ error: (err as Error).message });
-    }
+    const resultOverQuota = await quotaRefusal(db, userId, safeResultBuffer.length);
+    if (resultOverQuota) return reply.status(413).send({ error: resultOverQuota });
 
     // Persist to disk
     const storedName = await saveFile(safeResultBuffer, resultName);

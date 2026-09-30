@@ -47,6 +47,23 @@ function fileTooLargeError(limitBytes: number): Error {
   });
 }
 
+/**
+ * Mark a failure the parser raised about the request itself (a limit the
+ * client went over, a body that ends mid-part, a dropped connection) as the
+ * client's: 400, so a route that lets it escape answers 400 through the error
+ * handler instead of a reported 500 (#1473). multipartFailure() answers these
+ * 400 either way. An error that already carries a status (an over-limit
+ * file's 413) keeps it. Only for errors that can't be anything but the
+ * request's: a storage write fault has no status and must stay a 5xx.
+ */
+function requestError(err: unknown): Error {
+  const error = err instanceof Error ? err : new Error(String(err));
+  if ((error as { statusCode?: unknown }).statusCode === undefined) {
+    Object.assign(error, { statusCode: 400 });
+  }
+  return error;
+}
+
 const MIB = 1024 * 1024;
 
 function formatLimit(bytes: number): string {
@@ -62,6 +79,11 @@ function formatLimit(bytes: number): string {
  * client can tell "too big" from "malformed" (#1341). The limit comes from the
  * error (busboy's and putObjectStream's both carry it), falling back to
  * MAX_UPLOAD_SIZE_MB.
+ *
+ * A server-side fault (a 5xx: the workspace cap, the disk floor, a full or
+ * read-only volume, an S3 outage) is thrown back instead. Those aren't the
+ * client's, and the global error handler answers them with their own status,
+ * message and code, and reports them (#1421).
  */
 export function multipartFailure(
   err: unknown,
@@ -69,6 +91,7 @@ export function multipartFailure(
   | { status: 413; body: { error: string } }
   | { status: 400; body: { error: string; details: string } } {
   const e = err as { statusCode?: unknown; limitBytes?: unknown } | null;
+  if (typeof e?.statusCode === "number" && e.statusCode >= 500) throw err;
   if (e?.statusCode === 413) {
     const limitBytes =
       typeof e.limitBytes === "number" ? e.limitBytes : env.MAX_UPLOAD_SIZE_MB * MIB;
@@ -99,8 +122,8 @@ export function multipartFailure(
  * against @fastify/multipart 9.4.0 and 10.0.0. Busboy's own "finish" fires
  * only after every part has been emitted, so iteration ends there instead,
  * and the request stream's "close" is deliberately not treated as an end
- * signal (a client abort surfaces as an "error" on the stream and as a
- * truncated-part error from busboy).
+ * signal (a client abort surfaces as an "error" on the stream, which also
+ * fails the part being read).
  */
 export async function* multipartParts(
   request: FastifyRequest,
@@ -109,15 +132,24 @@ export async function* multipartParts(
   const raw = request.raw;
   const fileSizeLimit =
     limits.fileSize ?? (env.MAX_UPLOAD_SIZE_MB > 0 ? env.MAX_UPLOAD_SIZE_MB * MIB : undefined);
-  const bb = new Busboy({
-    headers: raw.headers as BusboyHeaders,
-    limits: {
-      fileSize: fileSizeLimit,
-      files: limits.files ?? (env.MAX_BATCH_SIZE > 0 ? env.MAX_BATCH_SIZE : undefined),
-      fieldSize: MULTIPART_FIELD_SIZE_BYTES,
-      fields: MULTIPART_MAX_FIELDS,
-    },
-  });
+  let bb: Busboy;
+  try {
+    bb = new Busboy({
+      headers: raw.headers as BusboyHeaders,
+      limits: {
+        fileSize: fileSizeLimit,
+        files: limits.files ?? (env.MAX_BATCH_SIZE > 0 ? env.MAX_BATCH_SIZE : undefined),
+        fieldSize: MULTIPART_FIELD_SIZE_BYTES,
+        fields: MULTIPART_MAX_FIELDS,
+      },
+    });
+  } catch (err) {
+    // A multipart Content-Type with no boundary, which a client that sets the
+    // header by hand on a FormData body sends.
+    throw requestError(err);
+  }
+  // The file part being read, if any: see the request "error" listener below.
+  let openFile: Readable | null = null;
 
   const queue: Array<MultipartPart | Error | typeof DONE> = [];
   let wake: (() => void) | null = null;
@@ -146,6 +178,12 @@ export async function* multipartParts(
     stream.on("error", () => {});
     // "limit" only fires when a fileSize limit is set, so fileSizeLimit is defined.
     stream.on("limit", () => stream.destroy(fileTooLargeError(fileSizeLimit ?? 0)));
+    openFile = stream;
+    const settled = () => {
+      if (openFile === stream) openFile = null;
+    };
+    stream.once("end", settled);
+    stream.once("close", settled);
     push({
       type: "file",
       fieldname,
@@ -159,17 +197,29 @@ export async function* multipartParts(
     // Busboy clips a field value at fieldSize and keeps going; a clipped
     // settings payload must fail loudly here, not parse as garbage downstream.
     if (valueTruncated) {
-      push(new Error(`field value too large: ${fieldname}`));
+      push(requestError(new Error(`field value too large: ${fieldname}`)));
       return;
     }
     push({ type: "field", fieldname, value });
   });
-  bb.on("filesLimit", () => push(new Error("reached files limit")));
-  bb.on("fieldsLimit", () => push(new Error("reached fields limit")));
-  bb.on("partsLimit", () => push(new Error("reached parts limit")));
-  bb.on("error", (err: unknown) => push(err instanceof Error ? err : new Error(String(err))));
+  bb.on("filesLimit", () => push(requestError(new Error("reached files limit"))));
+  bb.on("fieldsLimit", () => push(requestError(new Error("reached fields limit"))));
+  bb.on("partsLimit", () => push(requestError(new Error("reached parts limit"))));
+  // A request that fails can leave its last part open (#1473). A dropped
+  // connection errors the request and never ends it, so busboy never hears
+  // about it: a reader waiting on the part would wait forever, and the route
+  // could never undo what it had staged. And when the body stops partway
+  // through a part, busboy reports that on itself but ends the part as if it
+  // were complete, so its reader would take the truncated bytes for the whole
+  // file. Either way, fail the open part with the same error.
+  const fail = (err: unknown) => {
+    const error = requestError(err);
+    openFile?.destroy(error);
+    push(error);
+  };
+  bb.on("error", fail);
   bb.on("finish", () => push(DONE));
-  raw.on("error", (err: Error) => push(err));
+  raw.on("error", fail);
 
   raw.pipe(bb);
 
@@ -190,4 +240,22 @@ export async function* multipartParts(
     raw.unpipe(bb);
     bb.removeAllListeners();
   }
+}
+
+/**
+ * Read a file part into memory. Any failure here is the request's: the part
+ * is over the size limit (413, kept), the multipart content stops partway
+ * through it (busboy fails the part), or the connection drops (multipartParts
+ * fails the part), and the last two become a 400 instead of a reported 500
+ * (#1473). Only for a part read straight into memory: a part piped into
+ * storage can also fail with the storage's own error, which must stay a 5xx.
+ */
+export async function readFilePart(file: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  try {
+    for await (const chunk of file) chunks.push(chunk as Buffer);
+  } catch (err) {
+    throw requestError(err);
+  }
+  return Buffer.concat(chunks);
 }

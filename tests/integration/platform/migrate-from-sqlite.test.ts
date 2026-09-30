@@ -120,6 +120,9 @@ describe("migrate-from-sqlite", () => {
     const [user] = (await db.execute(sql`SELECT * FROM users WHERE id = 'u1'`)).rows;
     expect(user.username).toBe("alice");
     expect(user.must_change_password).toBe(false); // 0 became boolean false
+    // 1.x's column default was the team *name* "Default"; no team of that name
+    // came over, so it maps to the Default team's seeded id (#1474).
+    expect(user.team).toBe("default-team-00000000");
     expect(new Date(user.created_at as string).getTime()).toBe(1750000000 * 1000); // seconds became timestamptz
     const [pipeline] = (await db.execute(sql`SELECT * FROM pipelines WHERE id = 'p1'`)).rows;
     expect((pipeline.steps as Array<{ toolId: string }>)[0].toolId).toBe("compress"); // text JSON became jsonb
@@ -246,7 +249,7 @@ describe("migrate-from-sqlite (representative 1.x database)", () => {
       "sso-user",
       null,
       "user",
-      "Default",
+      "tm-3",
       0,
       "oidc",
       "ext-id-123",
@@ -480,6 +483,20 @@ describe("migrate-from-sqlite (representative 1.x database)", () => {
     expect(result.tables.jobs).toBe(4);
     expect(result.tables.audit_log).toBe(4);
     expect(result.tables.user_files).toBe(4);
+  });
+
+  it("maps 1.x team names to team ids (#1474)", async () => {
+    // 2.x looks teams up by id. 1.x wrote ids too, except where a row kept
+    // the column default 'Default', a name: any name maps to its team's id,
+    // and a value that's already an id stays.
+    const { rows } = await db.execute(
+      sql`SELECT id, team FROM users WHERE id IN ('u-admin', 'u-editor', 'u-oidc') ORDER BY id`,
+    );
+    expect(rows).toEqual([
+      { id: "u-admin", team: "tm-1" },
+      { id: "u-editor", team: "tm-2" },
+      { id: "u-oidc", team: "tm-3" },
+    ]);
   });
 
   it("boolean conversions: 0 -> false, 1 -> true", async () => {
@@ -866,6 +883,107 @@ describe("migrate-from-sqlite (an identity the target already holds)", () => {
   });
 });
 
+/**
+ * 1.x kept SCIM's externalId in users.external_id like every other provider's.
+ * The import runs after migrations, so it has to move SCIM rows' id into
+ * scim_external_id itself, the way the #1510 migration does for rows that were
+ * already in Postgres.
+ */
+describe("migrate-from-sqlite (SCIM identities, #1510)", () => {
+  const scimDir = mkdtempSync(join(tmpdir(), "snapotter-migrator-scim-"));
+  const scimPath = join(scimDir, "scim-1x.db");
+  const heldPath = join(scimDir, "scim-held-1x.db");
+  const incomingPath = join(scimDir, "scim-incoming-1x.db");
+
+  beforeAll(() => {
+    buildTwinSource(scimPath, [
+      {
+        id: "u-scim",
+        username: "scim-user",
+        provider: "scim",
+        externalId: "idp-1",
+        createdAt: 1748000000,
+      }, // prettier-ignore
+      // Same value under OIDC: a different identity, and it stays put.
+      {
+        id: "u-oidc",
+        username: "oidc-user",
+        provider: "oidc",
+        externalId: "idp-1",
+        createdAt: 1748000000,
+      }, // prettier-ignore
+    ]);
+    buildTwinSource(heldPath, [
+      {
+        id: "u-scim-held",
+        username: "scim-held",
+        provider: "scim",
+        externalId: "idp-held",
+        createdAt: 1748000000,
+      }, // prettier-ignore
+    ]);
+    buildTwinSource(incomingPath, [
+      {
+        id: "u-scim-incoming",
+        username: "scim-incoming",
+        provider: "scim",
+        externalId: "idp-held",
+        createdAt: 1700000000,
+      }, // prettier-ignore
+    ]);
+  });
+
+  afterAll(async () => {
+    await truncateMigratedTables();
+  });
+
+  it("moves a SCIM row's external_id into scim_external_id and leaves OIDC alone", async () => {
+    await truncateMigratedTables();
+    const run = await importCapturingWarnings(scimPath, { force: false });
+    expect(run.error).toBeNull();
+
+    const rows = (await db.execute(sql`SELECT * FROM users ORDER BY id`)).rows;
+    const scim = rows.find((u) => u.id === "u-scim");
+    expect(scim?.external_id).toBeNull();
+    expect(scim?.scim_external_id).toBe("idp-1");
+    const oidc = rows.find((u) => u.id === "u-oidc");
+    expect(oidc?.external_id).toBe("idp-1");
+    expect(oidc?.scim_external_id).toBeNull();
+  });
+
+  it("keeps a SCIM id with the account already in the target under --force", async () => {
+    await truncateMigratedTables();
+    await migrateFromSqlite(heldPath, { force: false });
+
+    const run = await importCapturingWarnings(incomingPath, { force: true });
+    expect(run.error).toBeNull();
+
+    const rows = (await db.execute(sql`SELECT * FROM users ORDER BY id`)).rows;
+    expect(rows.find((u) => u.id === "u-scim-held")?.scim_external_id).toBe("idp-held");
+    const incoming = rows.find((u) => u.id === "u-scim-incoming");
+    expect(incoming?.scim_external_id).toBeNull();
+    expect(incoming?.external_id).toBeNull();
+    expect(run.warnings.find((w) => w.includes("u-scim-incoming"))).toContain("idp-held");
+  });
+
+  it("keeps a SCIM id with a target account an OIDC link took over", async () => {
+    await truncateMigratedTables();
+    await migrateFromSqlite(heldPath, { force: false });
+    // What an OIDC auto-link does to the row: the SCIM id stays, the provider
+    // and sign-in identity change.
+    await db.execute(
+      sql`UPDATE users SET auth_provider = 'oidc', external_id = 'oidc-sub' WHERE id = 'u-scim-held'`,
+    );
+
+    const run = await importCapturingWarnings(incomingPath, { force: true });
+    expect(run.error).toBeNull();
+
+    const rows = (await db.execute(sql`SELECT * FROM users ORDER BY id`)).rows;
+    expect(rows.find((u) => u.id === "u-scim-held")?.scim_external_id).toBe("idp-held");
+    expect(rows.find((u) => u.id === "u-scim-incoming")?.scim_external_id).toBeNull();
+  });
+});
+
 describe("migrate-from-sqlite (real 1.17.2 schema)", () => {
   const realDir = mkdtempSync(join(tmpdir(), "snapotter-migrator-real-"));
   const realPath = join(realDir, "real-1x.db");
@@ -891,6 +1009,11 @@ describe("migrate-from-sqlite (real 1.17.2 schema)", () => {
     const [u] = (await db.execute(sql`SELECT * FROM users WHERE id = 'u-admin'`)).rows;
     expect(u.username).toBe("admin");
     expect(u).not.toHaveProperty("analytics_enabled");
+  });
+
+  it("maps the 1.x admin's team name to the Default team's id (#1474)", async () => {
+    const [u] = (await db.execute(sql`SELECT team FROM users WHERE id = 'u-admin'`)).rows;
+    expect(u.team).toBe("default-team-00000000");
   });
 
   it("maps the out-of-enum job status 'error' to 'failed'", async () => {

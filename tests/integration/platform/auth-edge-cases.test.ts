@@ -1116,7 +1116,12 @@ describe("Admin user-management guards", () => {
       payload: { newPassword: "weak" },
     });
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).code).toBe("VALIDATION_ERROR");
+    expect(JSON.parse(res.body)).toMatchObject({
+      code: "VALIDATION_ERROR",
+      rule: "minLength",
+      minLength: 8,
+      error: expect.stringMatching(/^Password must/),
+    });
   });
 
   it("reset-password on a passwordless (OIDC/SSO) user returns 400 OIDC_NO_PASSWORD", async () => {
@@ -1162,6 +1167,83 @@ describe("Admin user-management guards", () => {
     });
     expect(res.statusCode).toBe(401);
     expect(JSON.parse(res.body).code).toBe("INVALID_PASSWORD");
+  });
+
+  // The client can't read the password policy (a user who must change their
+  // password can't reach /v1/settings), so a weak password names the rule it
+  // broke and the client words it in the UI language (#1446). `error` stays
+  // the English sentence: the Settings dialog still shows it as-is.
+  async function loggedInUser() {
+    const { username, password } = await createUser();
+    return { password, token: await loginAs(username, password) };
+  }
+
+  function sendChangePassword(user: { password: string; token: string }, newPassword: string) {
+    return testApp.app.inject({
+      method: "POST",
+      url: "/api/auth/change-password",
+      headers: { authorization: `Bearer ${user.token}` },
+      payload: { currentPassword: user.password, newPassword },
+    });
+  }
+
+  it.each([
+    ["Short1A", { rule: "minLength", minLength: 8 }],
+    ["alllower1", { rule: "uppercase" }],
+    ["ALLUPPER1", { rule: "lowercase" }],
+    ["NoDigitsHere", { rule: "digit" }],
+  ])("change-password to %s names the broken rule", async (newPassword, expected) => {
+    const res = await sendChangePassword(await loggedInUser(), newPassword);
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toMatchObject({
+      code: "VALIDATION_ERROR",
+      error: expect.stringMatching(/^Password must/),
+      ...expected,
+    });
+  });
+
+  it("change-password names the special-character rule when the policy requires one", async () => {
+    // The user first: createUser's own password has no special character.
+    const user = await loggedInUser();
+    await setSetting("passwordRequireSpecial", "true");
+    try {
+      const res = await sendChangePassword(user, "NoSpecial9");
+
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body)).toMatchObject({ code: "VALIDATION_ERROR", rule: "special" });
+    } finally {
+      await clearSetting("passwordRequireSpecial");
+    }
+  });
+
+  it("change-password echoes the configured minimum length, not the default", async () => {
+    const user = await loggedInUser();
+    await setSetting("passwordMinLength", "12");
+    try {
+      const res = await sendChangePassword(user, "Elevenchar1");
+
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body)).toMatchObject({ rule: "minLength", minLength: 12 });
+    } finally {
+      await clearSetting("passwordMinLength");
+    }
+  });
+
+  it("register names the broken password rule too", async () => {
+    const res = await testApp.app.inject({
+      method: "POST",
+      url: "/api/auth/register",
+      headers: { authorization: `Bearer ${adminToken}` },
+      payload: { username: uid(), password: "Short1A" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toMatchObject({
+      code: "VALIDATION_ERROR",
+      rule: "minLength",
+      minLength: 8,
+      error: expect.stringMatching(/^Password must/),
+    });
   });
 });
 

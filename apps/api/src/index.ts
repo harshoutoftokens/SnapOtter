@@ -23,6 +23,7 @@ import { reconcileStrandedJobs } from "./jobs/job-reconciliation.js";
 import { closeQueues, perPoolHealth, queueCounts } from "./jobs/queues.js";
 import { enqueueSystemJob, SYSTEM_JOBS, scheduleSystemJobs } from "./jobs/system-jobs.js";
 import { closeWorkers, startWorkers } from "./jobs/worker.js";
+import { routeAiLogsToPino } from "./lib/ai-log-sink.js";
 import { initAnalytics, shutdownAnalytics, trackEvent } from "./lib/analytics.js";
 import { stripBasePath } from "./lib/base-path.js";
 import { shouldRunStartupCleanup } from "./lib/cleanup.js";
@@ -92,6 +93,9 @@ import { teamsRoutes } from "./routes/teams.js";
 import { registerToolRoutes } from "./routes/tools/index.js";
 import { userFileRoutes } from "./routes/user-files.js";
 import { shutdownTracing } from "./tracing.js";
+
+// Before anything can log from packages/ai, so its lines reach LOG_DIR (#1500).
+routeAiLogsToPino();
 
 // Run before anything else, and before the retry loop below: a rejected
 // DATABASE_URL / DATABASE_MIGRATION_URL pair fails the same way on every attempt,
@@ -180,15 +184,21 @@ try {
 }
 console.log("Redis connected");
 
-// Verify the local storage directories are writable before serving. A non-root
-// container launched against a volume it cannot write (TrueNAS, Kubernetes
-// runAsUser / OpenShift, or a bind mount owned by another user) would otherwise
-// boot "healthy" and fail with a cryptic EACCES on the first file operation.
+// Verify the local storage and log directories are writable before serving. A
+// non-root container launched against a volume it cannot write (TrueNAS,
+// Kubernetes runAsUser / OpenShift, or a bind mount owned by another user)
+// would otherwise boot "healthy" and fail with a cryptic EACCES on the first
+// file operation, or die on an unhandled transport error from the log writer.
 try {
   await assertStorageWritable();
-  console.log("Storage directories writable");
+  console.log("Storage and log directories writable");
 } catch (err) {
+  // A permission failure carries its own remediation text. Anything else the
+  // probe rethrows (EEXIST when the path is a file, ENOTDIR, ENOENT for an
+  // empty LOG_DIR) is a raw errno, so print the error too, as the other FATAL
+  // blocks above do.
   console.error(`FATAL: ${(err as Error).message}`);
+  console.error(err);
   process.exit(1);
 }
 

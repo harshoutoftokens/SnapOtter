@@ -1,6 +1,12 @@
 import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
-import { ANALYTICS_EVENTS } from "@snapotter/shared";
+import {
+  ANALYTICS_EVENTS,
+  type PasswordRule,
+  USERNAME_MAX_LENGTH,
+  USERNAME_MIN_LENGTH,
+  USERNAME_PATTERN,
+} from "@snapotter/shared";
 import { and, asc, eq, ne, sql } from "drizzle-orm";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
@@ -87,9 +93,26 @@ export function computeKeyPrefix(rawKey: string): string {
   return createHash("sha256").update(rawKey).digest("hex").slice(0, 16);
 }
 
-async function validatePasswordStrength(password: string): Promise<string | null> {
+/**
+ * The password-policy rule a password broke. `rule` (and `minLength`) travel
+ * in the 400 so a client can word the failure in its own language; it can't
+ * read the policy itself before the user has a usable password (#1446).
+ */
+interface PasswordRuleFailure {
+  message: string;
+  rule: PasswordRule;
+  minLength?: number;
+}
+
+async function validatePasswordStrength(password: string): Promise<PasswordRuleFailure | null> {
   const minLength = await getSettingNumber("passwordMinLength", 8);
-  if (password.length < minLength) return `Password must be at least ${minLength} characters`;
+  if (password.length < minLength) {
+    return {
+      message: `Password must be at least ${minLength} characters`,
+      rule: "minLength",
+      minLength,
+    };
+  }
 
   const requireUpper = await getSettingString("passwordRequireUppercase", "true");
   const requireLower = await getSettingString("passwordRequireLowercase", "true");
@@ -97,21 +120,32 @@ async function validatePasswordStrength(password: string): Promise<string | null
   const requireSpecial = await getSettingString("passwordRequireSpecial", "false");
 
   if (requireUpper === "true" && !/[A-Z]/.test(password))
-    return "Password must contain an uppercase letter";
+    return { message: "Password must contain an uppercase letter", rule: "uppercase" };
   if (requireLower === "true" && !/[a-z]/.test(password))
-    return "Password must contain a lowercase letter";
-  if (requireDigit === "true" && !/\d/.test(password)) return "Password must contain a digit";
+    return { message: "Password must contain a lowercase letter", rule: "lowercase" };
+  if (requireDigit === "true" && !/\d/.test(password))
+    return { message: "Password must contain a digit", rule: "digit" };
   if (requireSpecial === "true" && !/[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]/.test(password))
-    return "Password must contain a special character";
+    return { message: "Password must contain a special character", rule: "special" };
 
   return null;
 }
 
+/** The 400 body for a password that broke the policy. */
+function weakPasswordBody({ message, rule, minLength }: PasswordRuleFailure) {
+  return {
+    error: message,
+    code: "VALIDATION_ERROR",
+    rule,
+    ...(minLength !== undefined && { minLength }),
+  };
+}
+
 function validateUsername(username: string): string | null {
-  if (username.length < 3 || username.length > 50) {
+  if (username.length < USERNAME_MIN_LENGTH || username.length > USERNAME_MAX_LENGTH) {
     return "Username must be between 3 and 50 characters";
   }
-  if (!/^[a-zA-Z0-9_.-]+$/.test(username)) {
+  if (!USERNAME_PATTERN.test(username)) {
     return "Username can only contain letters, numbers, dots, hyphens, and underscores";
   }
   return null;
@@ -196,8 +230,23 @@ export function createSessionToken(): string {
 export async function ensureDefaultTeam(): Promise<void> {
   await db
     .insert(schema.teams)
-    .values({ id: "default-team-00000000", name: "Default" })
+    .values({ id: schema.DEFAULT_TEAM_ID, name: "Default" })
     .onConflictDoNothing();
+}
+
+/**
+ * The Default team's id: the team named "Default", else the seeded id (the
+ * seeded team renamed). Register, SSO, and SCIM resolve it the same way, and
+ * the bootstrap users need it explicitly (#1474): the seed above is skipped
+ * when another team already holds the name, so the column default alone can
+ * point at a team that doesn't exist.
+ */
+async function defaultTeamId(): Promise<string> {
+  const [team] = await db
+    .select({ id: schema.teams.id })
+    .from(schema.teams)
+    .where(eq(schema.teams.name, "Default"));
+  return team?.id ?? schema.DEFAULT_TEAM_ID;
 }
 
 export async function ensureAnonymousUser(): Promise<void> {
@@ -210,6 +259,7 @@ export async function ensureAnonymousUser(): Promise<void> {
       id: "anonymous",
       username: "anonymous",
       role: "admin",
+      team: await defaultTeamId(),
       mustChangePassword: false,
       authProvider: "local",
     })
@@ -231,6 +281,7 @@ export async function ensureDefaultAdmin(): Promise<void> {
       username: env.DEFAULT_USERNAME,
       passwordHash,
       role: "admin",
+      team: await defaultTeamId(),
       mustChangePassword: mustChange,
     })
     .onConflictDoNothing();
@@ -725,7 +776,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         loginMethod: session.idToken ? "oidc" : user.authProvider === "saml" ? "saml" : "local",
         email: user.email ?? null,
         hasLocalPassword: !!user.passwordHash,
-        hasOidcLink: !!user.externalId,
+        // external_id also holds SAML NameIDs, so the provider decides (#1606).
+        hasOidcLink: user.authProvider === "oidc" && !!user.externalId,
         totpEnabled: user.totpEnabled,
       },
       expiresAt: session.expiresAt.toISOString(),
@@ -751,10 +803,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
       const pwError = await validatePasswordStrength(body.newPassword);
       if (pwError) {
-        return reply.status(400).send({
-          error: pwError,
-          code: "VALIDATION_ERROR",
-        });
+        return reply.status(400).send(weakPasswordBody(pwError));
       }
 
       const [user] = await db.select().from(schema.users).where(eq(schema.users.id, authUser.id));
@@ -838,7 +887,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         authProvider: u.authProvider ?? "local",
         email: u.email ?? null,
         hasLocalPassword: !!u.passwordHash,
-        hasOidcLink: !!u.externalId,
+        // Same rule as the session response: external_id alone could be SAML's.
+        hasOidcLink: u.authProvider === "oidc" && !!u.externalId,
         createdAt: u.createdAt.toISOString(),
       })),
       maxUsers: env.MAX_USERS,
@@ -869,10 +919,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
     const registerPwError = await validatePasswordStrength(body.password);
     if (registerPwError) {
-      return reply.status(400).send({
-        error: registerPwError,
-        code: "VALIDATION_ERROR",
-      });
+      return reply.status(400).send(weakPasswordBody(registerPwError));
     }
 
     const validBuiltinRoles = ["admin", "editor", "user"];
@@ -1123,10 +1170,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
       const pwError = await validatePasswordStrength(body.newPassword);
       if (pwError) {
-        return reply.status(400).send({
-          error: pwError,
-          code: "VALIDATION_ERROR",
-        });
+        return reply.status(400).send(weakPasswordBody(pwError));
       }
 
       const [user] = await db.select().from(schema.users).where(eq(schema.users.id, id));

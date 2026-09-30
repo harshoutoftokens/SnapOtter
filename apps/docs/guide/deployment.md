@@ -43,6 +43,14 @@ services:
       # --- Bind mount permissions ---
       # - PUID=1000                # Match your host user's UID (run: id -u)
       # - PGID=1000                # Match your host user's GID (run: id -g)
+
+      # --- Engines (empty = the image's own binaries, see Configuration) ---
+      - FFMPEG_PATH=${FFMPEG_PATH:-}
+      - FFPROBE_PATH=${FFPROBE_PATH:-}
+      - QPDF_PATH=${QPDF_PATH:-}
+      - SOFFICE_PATH=${SOFFICE_PATH:-}
+      - PDFCPU_PATH=${PDFCPU_PATH:-}
+      - SNAPOTTER_HW_ACCEL=${SNAPOTTER_HW_ACCEL:-}  # nvenc|vaapi, needs your own ffmpeg build
     depends_on:
       postgres:
         condition: service_healthy
@@ -132,6 +140,13 @@ services:
       - DEFAULT_PASSWORD=admin
       - DATABASE_URL=postgres://snapotter:snapotter@postgres:5432/snapotter
       - REDIS_URL=redis://redis:6379
+      # Engines (empty = the image's own binaries, see Configuration)
+      - FFMPEG_PATH=${FFMPEG_PATH:-}
+      - FFPROBE_PATH=${FFPROBE_PATH:-}
+      - QPDF_PATH=${QPDF_PATH:-}
+      - SOFFICE_PATH=${SOFFICE_PATH:-}
+      - PDFCPU_PATH=${PDFCPU_PATH:-}
+      - SNAPOTTER_HW_ACCEL=${SNAPOTTER_HW_ACCEL:-}  # nvenc|vaapi, needs your own ffmpeg build
     depends_on:
       postgres:
         condition: service_healthy
@@ -396,7 +411,7 @@ environment:
 
 ### Storage permissions {#storage-permissions}
 
-SnapOtter writes to two locations at runtime: `/data` (user files, logs, AI models and the Python venv) and `/tmp/workspace` (temporary processing scratch). Both must be writable by the user the container runs as. If either is not, the container **fails fast at startup** with a message naming the directory, the running UID/GID, and how to fix it — instead of booting "healthy" and then failing on the first upload with a cryptic error.
+SnapOtter writes to two locations at runtime: `/data` (user files, logs, AI models and the Python venv) and `/tmp/workspace` (temporary processing scratch). Both must be writable by the user the container runs as. If either is not, the container **fails fast at startup** with a message naming the directory, the running UID/GID, and how to fix it — instead of booting "healthy" and then failing on the first upload with a cryptic error. The log directory (`LOG_DIR`, `/data/logs` in the image) is checked the same way, in every storage mode, since logs stay local even when files live in S3.
 
 How permissions are handled depends on how the container is launched:
 

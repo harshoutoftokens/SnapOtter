@@ -6,6 +6,7 @@ import { detectFaceLandmarks, removeBackground } from "@snapotter/ai";
 import {
   FEATURE_BUNDLES,
   formatTargetKb,
+  hasServerErrorStatus,
   kbToBytes,
   PASSPORT_SPECS,
   PRINT_LAYOUTS,
@@ -312,6 +313,7 @@ export function registerPassportPhoto(app: FastifyInstance) {
         });
       } catch (err) {
         if (isDecoderUnavailable(err)) throw err;
+        if (hasServerErrorStatus(err)) throw err;
         request.log.error({ err, toolId: "passport-photo" }, "Passport photo analysis failed");
         return reply.status(422).send({
           error: "Passport photo analysis failed",
@@ -560,6 +562,7 @@ export function registerPassportPhoto(app: FastifyInstance) {
 
         return reply.send(response);
       } catch (err) {
+        if (hasServerErrorStatus(err)) throw err;
         request.log.error({ err, toolId: "passport-photo" }, "Passport photo generation failed");
         return reply.status(422).send({
           error: "Passport photo generation failed",

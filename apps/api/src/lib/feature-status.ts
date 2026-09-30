@@ -41,6 +41,7 @@ import {
 } from "@snapotter/shared";
 import * as tar from "tar";
 import { getQueuedBundleIds } from "./feature-install-queue.js";
+import { logger } from "./logger.js";
 
 // ── Paths ───────────────────────────────────────────────────────────────
 
@@ -85,6 +86,17 @@ export function getInstallScriptPath(): string {
   return join(PROJECT_ROOT, "packages/ai/python/install_feature.py");
 }
 
+// Startup recovery retries a failed sweep every few seconds, so each stuck
+// path is warned about once per errno rather than on every attempt (#1565).
+const importSweepWarnings = new Map<string, string>();
+
+function warnImportSweepFailure(key: string, message: string, error: unknown): void {
+  const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+  if (importSweepWarnings.get(key) === code) return;
+  importSweepWarnings.set(key, code);
+  console.warn(`${message} (${code}):`, error);
+}
+
 /**
  * Remove upload/extraction staging only while this process owns install.flock.
  * New v2 uploads are always lock-owned. Pre-v2 upload directories are age
@@ -98,8 +110,14 @@ export function cleanupInterruptedFeatureImports(nowMs = Date.now()): boolean {
     entries = readdirSync(AI_DIR, { withFileTypes: true });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    warnImportSweepFailure(
+      AI_DIR,
+      `[feature-status] Cannot list ${AI_DIR} to sweep interrupted import staging`,
+      error,
+    );
     return false;
   }
+  importSweepWarnings.delete(AI_DIR);
 
   let complete = true;
   for (const entry of entries) {
@@ -119,8 +137,16 @@ export function cleanupInterruptedFeatureImports(nowMs = Date.now()): boolean {
       if (info.isSymbolicLink()) unlinkSync(path);
       else rmSync(path, { recursive: true, force: true });
       console.info(`[feature-status] Deleted orphaned ${entry.name}/`);
+      importSweepWarnings.delete(path);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") complete = false;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        complete = false;
+        warnImportSweepFailure(
+          path,
+          `[feature-status] Cannot remove orphaned ${entry.name}/`,
+          error,
+        );
+      }
     }
   }
   return complete;
@@ -1331,6 +1357,20 @@ export function verifyBundleModels(bundleId: string): string | null {
   return null;
 }
 
+// Feature states are polled, so a memory read that keeps failing is logged once
+// per distinct error, and again only after a read has worked in between (#1501).
+let lastLoggedOcrMemoryFailure: string | null = null;
+
+/** An error's message and its causes' messages, as one string to compare. */
+function causeChain(error: unknown): string {
+  const messages: string[] = [];
+  for (let e: unknown = error, depth = 0; e !== undefined && depth < 5; depth++) {
+    messages.push(e instanceof Error ? e.message : String(e));
+    e = e instanceof Error ? e.cause : undefined;
+  }
+  return messages.join(": ");
+}
+
 export function getFeatureStates(): FeatureBundleState[] {
   const installed = readInstalled();
   const lock = getInstallingBundle();
@@ -1353,8 +1393,22 @@ export function getFeatureStates(): FeatureBundleState[] {
   if (selectedOcrTarget) {
     try {
       effectiveOcrMemoryBytes = getOcrRuntimeEffectiveMemoryBytes();
-    } catch {
+      lastLoggedOcrMemoryFailure = null;
+    } catch (error) {
       ocrMemoryCapacityUnknown = true;
+      // The UI only says the limit couldn't be determined; the log says why.
+      // Only for a missing runtime, the one case where this read decides what
+      // the UI shows: an installed runtime's own check has already logged it.
+      const failure = causeChain(error);
+      const runtimeMissing =
+        !ocrCapability.available && ocrCapability.reason === "descriptor-missing";
+      if (runtimeMissing && failure !== lastLoggedOcrMemoryFailure) {
+        lastLoggedOcrMemoryFailure = failure;
+        logger.warn(
+          { err: error },
+          "[ocr-runtime] Accurate OCR can't be offered: this container's memory limit couldn't be read",
+        );
+      }
     }
   }
   const ocrMemoryCompatible =

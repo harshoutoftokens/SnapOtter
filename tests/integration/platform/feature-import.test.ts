@@ -596,6 +596,46 @@ describe("POST /api/v1/admin/features/import", () => {
     expect(importRouteRateLimit).toEqual({ max: 10, timeWindow: "1 minute" });
   });
 
+  it("answers 400, not 500, for a multipart request with no boundary (#1539)", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/features/import",
+      headers: {
+        "content-type": "multipart/form-data",
+        authorization: `Bearer ${token}`,
+      },
+      payload: "not multipart",
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("Failed to parse multipart request");
+  });
+
+  it("answers 400, not 500, for a body that ends mid-part (#1539)", async () => {
+    const { body, contentType } = createMultipartPayload([
+      {
+        name: "file",
+        filename: "test-bundle.tar.gz",
+        contentType: "application/gzip",
+        content: Buffer.alloc(64, 0xcd),
+      },
+    ]);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/features/import",
+      headers: {
+        "content-type": contentType,
+        authorization: `Bearer ${token}`,
+      },
+      // Cut the closing boundary and part of the file off.
+      payload: body.subarray(0, body.length - 40),
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("Failed to parse multipart request");
+  });
+
   it("imports a valid bundle via multipart POST", async () => {
     const fakeModel = Buffer.alloc(128, 0xcd);
     const archivePath = await buildArchive(

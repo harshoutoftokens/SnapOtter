@@ -2,6 +2,7 @@ import { isSafeMessageError, isToolInputError, SafeError, ToolInputError } from 
 import sharp from "sharp";
 import { isPixelSafetyError } from "../modality/image-input.js";
 import type { LegacyToolProcessResult, ToolProcessCtx } from "../routes/tool-factory.js";
+import { isOperationalErrno } from "./error-report.js";
 import { logger } from "./logger.js";
 
 /** Short single-line messages so friendlyError() passes them to the client verbatim. */
@@ -9,6 +10,18 @@ export const UNDECODABLE_IMAGE_MESSAGE =
   "This image can't be decoded. The file may be corrupt or use an unsupported encoding.";
 export const PIXEL_LIMIT_IMAGE_MESSAGE =
   "This image is too large to process. Reduce its dimensions and try again.";
+
+/** User-facing reasons for an environmental errno, one constant per kind of fault. */
+export const DISK_ENVIRONMENT_MESSAGE =
+  "The server couldn't write its temporary files: it's out of disk space or not allowed to write there.";
+export const DESCRIPTOR_ENVIRONMENT_MESSAGE =
+  "The server has too many files open to process this image right now. Try again shortly.";
+
+function environmentMessage(code: string): string {
+  return code === "EMFILE" || code === "ENFILE"
+    ? DESCRIPTOR_ENVIRONMENT_MESSAGE
+    : DISK_ENVIRONMENT_MESSAGE;
+}
 
 type ImageProcess<T> = (
   inputBuffer: Buffer,
@@ -28,6 +41,13 @@ type ImageProcess<T> = (
  * kept as `cause`, preserving its stack and exact location. Errors we already
  * author (SafeError) or that flag bad user input (ToolInputError) pass through
  * untouched so their class is not masked.
+ *
+ * An environmental errno (a full disk or a permission error while writing a
+ * temp file or spawning an encoder) is the host's problem, not our code, so it
+ * becomes an operational SafeError instead of a bug (#1450). Its code is the
+ * errno, so reportError still groups it with every other ENOSPC or EACCES, and
+ * the message is a sentence written for the user rather than Node's text,
+ * which can carry temp paths.
  */
 export function withImageEncodeContext<T>(
   message: string,
@@ -39,6 +59,10 @@ export function withImageEncodeContext<T>(
       return await process(inputBuffer, settings, filename, ctx);
     } catch (err) {
       if (isSafeMessageError(err) || isToolInputError(err)) throw err;
+      if (err instanceof Error && isOperationalErrno(err)) {
+        const code = String((err as NodeJS.ErrnoException).code);
+        throw new SafeError(environmentMessage(code), { kind: "operational", code, cause: err });
+      }
       throw new SafeError(message, {
         kind: "bug",
         code: codeOf(settings),

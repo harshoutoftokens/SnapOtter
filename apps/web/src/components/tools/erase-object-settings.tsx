@@ -7,8 +7,14 @@ import { useAuth } from "@/hooks/use-auth";
 import { formatHeaders } from "@/lib/api";
 import { appUrl, resolveServerUrls } from "@/lib/app-url";
 import { bundleName } from "@/lib/bundle-i18n";
+import { FeedbackCategoryError, feedbackCategoryOf } from "@/lib/feedback";
 import { format, formatFileSize } from "@/lib/format";
-import { FRAME_HANDLING_FAILED, type ProgressFrame } from "@/lib/progress-frames";
+import {
+  frameFailure,
+  type JobFailure,
+  jobFailureMessage,
+  type ProgressFrame,
+} from "@/lib/progress-frames";
 import { generateId } from "@/lib/utils";
 import { useFeaturesStore } from "@/stores/features-store";
 import { useFileStore } from "@/stores/file-store";
@@ -35,7 +41,7 @@ const SSE_STALL_TIMEOUT_MS = 5 * 60_000;
 interface ProgressHandlers {
   onProgress?: (percent: number) => void;
   onComplete: (result: Record<string, unknown>) => void;
-  onFailed: (error: string) => void;
+  onFailed: (failure: JobFailure) => void;
   onStall: () => void;
 }
 
@@ -116,7 +122,7 @@ export function subscribeEraseObjectJobProgress(
         }
         if (data.phase === "failed") {
           cleanup();
-          handlers.onFailed(typeof data.error === "string" ? data.error : "Processing failed");
+          handlers.onFailed(frameFailure(data.error, data.details));
           return;
         }
         if (typeof data.percent === "number") handlers.onProgress?.(data.percent);
@@ -125,7 +131,7 @@ export function subscribeEraseObjectJobProgress(
         // with it, so nothing else would ever settle the run.
         cleanup();
         try {
-          handlers.onFailed(FRAME_HANDLING_FAILED);
+          handlers.onFailed({ reason: "trackingFailed" });
         } catch {
           // onFailed may be what threw; the original error is rethrown below.
         }
@@ -227,9 +233,9 @@ export function EraseObjectSettings({
           applyResult(r);
           resolve();
         },
-        onFailed: (err) => reject(new Error(err)),
+        onFailed: (failure) => reject(new Error(jobFailureMessage(failure, t.errors))),
         onStall: () =>
-          reject(new Error("Processing timed out. The result may have saved -- check your files.")),
+          reject(new FeedbackCategoryError(t.toolSettings["erase-object"].stallBatch, "timeout")),
       });
 
       const maskFile = new File([maskBlob], "mask.png", { type: "image/png" });
@@ -251,7 +257,7 @@ export function EraseObjectSettings({
             applyResult(resolveServerUrls(JSON.parse(xhr.responseText)));
             resolve();
           } catch {
-            reject(new Error("Invalid response"));
+            reject(new Error(t.errors.invalidResponse));
           }
         } else {
           try {
@@ -262,21 +268,21 @@ export function EraseObjectSettings({
                   ? body.error
                   : typeof body.details === "string"
                     ? body.details
-                    : `Failed: ${xhr.status}`,
+                    : format(t.errors.failedWithStatus, { status: xhr.status }),
               ),
             );
           } catch {
-            reject(new Error(`Processing failed: ${xhr.status}`));
+            reject(new Error(format(t.errors.processingFailedWithStatus, { status: xhr.status })));
           }
         }
       };
       xhr.onerror = () => {
         stopProgress();
-        reject(new Error("Network error"));
+        reject(new Error(t.errors.network));
       };
       xhr.ontimeout = () => {
         stopProgress();
-        reject(new Error("Request timed out"));
+        reject(new FeedbackCategoryError(t.errors.requestTimedOut, "timeout"));
       };
       xhr.open("POST", appUrl("/api/v1/tools/image/erase-object"));
       for (const [key, value] of formatHeaders()) {
@@ -355,16 +361,14 @@ export function EraseObjectSettings({
         applyResult(r);
         finishUi();
       },
-      onFailed: (err) => {
+      onFailed: (failure) => {
         progressCleanupRef.current = null;
-        setError(err);
+        setError(jobFailureMessage(failure, t.errors));
         finishUi();
       },
       onStall: () => {
         progressCleanupRef.current = null;
-        setError(
-          "Processing timed out with no progress. The result may have saved to your files -- otherwise, try again.",
-        );
+        setError(t.toolSettings["erase-object"].stall);
         finishUi();
       },
     });
@@ -406,7 +410,7 @@ export function EraseObjectSettings({
         try {
           applyResult(resolveServerUrls(JSON.parse(xhr.responseText)));
         } catch {
-          setError("Invalid response");
+          setError(t.errors.invalidResponse);
         }
       } else {
         try {
@@ -416,10 +420,10 @@ export function EraseObjectSettings({
               ? body.error
               : typeof body.details === "string"
                 ? body.details
-                : `Failed: ${xhr.status}`,
+                : format(t.errors.failedWithStatus, { status: xhr.status }),
           );
         } catch {
-          setError(`Processing failed: ${xhr.status}`);
+          setError(format(t.errors.processingFailedWithStatus, { status: xhr.status }));
         }
       }
       finishUi();
@@ -427,13 +431,13 @@ export function EraseObjectSettings({
     xhr.onerror = () => {
       stopProgress();
       progressCleanupRef.current = null;
-      setError("Network error");
+      setError(t.errors.network);
       finishUi();
     };
     xhr.ontimeout = () => {
       stopProgress();
       progressCleanupRef.current = null;
-      setError("Request timed out - the server may be overloaded. Try again.");
+      setError(t.toolSettings["erase-object"].timeoutOverloaded);
       finishUi();
     };
     xhr.open("POST", appUrl("/api/v1/tools/image/erase-object"));
@@ -484,7 +488,12 @@ export function EraseObjectSettings({
 
       setProgressPhase("processing");
       setProgressPercent(basePercent);
-      setProgressStage(`Erasing ${wi + 1}/${work.length}`);
+      setProgressStage(
+        format(t.toolSettings["erase-object"].erasingProgress, {
+          current: wi + 1,
+          total: work.length,
+        }),
+      );
 
       useFileStore.getState().updateEntry(index, { status: "processing", error: null });
 
@@ -495,7 +504,8 @@ export function EraseObjectSettings({
       } catch (err) {
         useFileStore.getState().updateEntry(index, {
           status: "failed",
-          error: err instanceof Error ? err.message : "Processing failed",
+          error: err instanceof Error ? err.message : t.errors.processingFailedNoDetail,
+          errorCategory: feedbackCategoryOf(err),
         });
       }
     }
@@ -606,7 +616,7 @@ export function EraseObjectSettings({
                   : format(t.features.enableButton, {
                       name: bundleName(
                         t,
-                        hqBundle ?? { id: HQ_BUNDLE_ID, name: "High-Quality Inpainting" },
+                        hqBundle ?? { id: HQ_BUNDLE_ID, name: t.featureBundles["inpaint-hq"].name },
                       ),
                     })}
               </button>

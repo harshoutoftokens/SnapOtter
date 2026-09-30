@@ -1,12 +1,12 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyBaseLogger, FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { env } from "../../config.js";
 import { db, schema } from "../../db/index.js";
 import { sharedRedis } from "../../jobs/connection.js";
 import { auditLog } from "../../lib/audit.js";
 import { isEnterpriseFeatureEnabled } from "../../lib/enterprise-feature.js";
-import { isUniqueViolation } from "../../lib/pg-errors.js";
+import { isUniqueViolation, uniqueViolationConstraint } from "../../lib/pg-errors.js";
 import { getSettingString, upsertSetting } from "../../lib/settings-helpers.js";
 import { userLimitReached } from "../../lib/user-limit.js";
 import { isDisabledRole, requireFullAdmin } from "../../permissions.js";
@@ -17,12 +17,68 @@ const SCIM_TOKEN_SUFFIX_PATTERN = /^[0-9a-f]{64}$/;
 
 // ── SCIM Error Format ────────────────────────────────────────────
 
-function scimError(status: number, detail: string) {
+function scimError(status: number, detail: string, scimType?: string) {
   return {
     schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"],
     detail,
     status,
+    ...(scimType ? { scimType } : {}),
   };
+}
+
+// A SCIM user UPDATE can trip either unique index it writes to: userName, or
+// the SCIM externalId (issue #1510). Name the one that fired (issue #1006)
+// instead of blaming userName for both, and don't guess at an index added later.
+function userUpdateConflict(err: unknown, log: FastifyBaseLogger) {
+  const constraint = uniqueViolationConstraint(err);
+  if (constraint === "users_scim_external_id_unique") {
+    return scimError(409, "externalId already assigned to another user", "uniqueness");
+  }
+  if (constraint === "users_username_unique") {
+    return scimError(409, "userName already taken", "uniqueness");
+  }
+  log.warn({ constraint }, "SCIM user update hit an unmapped unique constraint");
+  return scimError(409, "Update conflicts with an existing user", "uniqueness");
+}
+
+// The same for a SCIM group write, which today can only trip the team name
+// indexes. Undefined when the error isn't a unique violation at all, so the
+// caller rethrows it (#1543, #1682).
+function groupWriteConflict(err: unknown, log: FastifyBaseLogger, teamId: string) {
+  const constraint = uniqueViolationConstraint(err);
+  if (constraint === "teams_name_unique" || constraint === "teams_name_lower_unique") {
+    return scimError(409, "Group name already taken", "uniqueness");
+  }
+  if (!isUniqueViolation(err)) return undefined;
+  log.warn({ constraint, teamId }, "SCIM group write hit an unmapped unique constraint");
+  return scimError(409, "Update conflicts with an existing record", "uniqueness");
+}
+
+// Deactivating revokes the user's sessions. Doing that in the same
+// transaction as the UPDATE means a 409 on the UPDATE rolls the revoke back
+// too, instead of leaving an active user logged out (issue #1508).
+async function updateScimUser(
+  id: string,
+  updates: Record<string, unknown>,
+  revokeSessions: boolean,
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    await tx.update(schema.users).set(updates).where(eq(schema.users.id, id));
+    if (revokeSessions) {
+      await tx.delete(schema.sessions).where(eq(schema.sessions.userId, id));
+    }
+  });
+}
+
+type ScimPatchOp = { op: string; path?: string; value?: unknown };
+
+/** The trimmed new name a Groups PATCH op renames to, empty when it names none. */
+function groupRenameTarget(op: ScimPatchOp): string {
+  return (op.value as string | undefined)?.trim() ?? "";
+}
+
+function isGroupRename(op: ScimPatchOp): boolean {
+  return op.op.toLowerCase() === "replace" && op.path === "displayName";
 }
 
 async function rejectLastActiveAdminDeactivation(
@@ -45,6 +101,17 @@ async function rejectLastActiveAdminDeactivation(
 
 function scimActiveValue(value: unknown): boolean {
   return value === true || value === "true" || value === "True";
+}
+
+// A blank externalId means no external identity. Stored as "", it takes the
+// unique index slot that NULL leaves free, so the next blank one collides
+// (issue #1008). Non-blank values are kept verbatim so the
+// externalId filter still matches exactly what the IdP sent. This does no type
+// checking: SCIM bodies have no schema yet, so a non-string passes through as
+// it did before.
+function scimExternalId(value: unknown): string | null {
+  if (typeof value === "string" && value.trim() === "") return null;
+  return (value as string | null | undefined) ?? null;
 }
 
 const DISABLED_ROLE_PREFIX = "disabled:";
@@ -148,7 +215,7 @@ function toScimUser(
     id: string;
     username: string;
     email: string | null;
-    externalId: string | null;
+    scimExternalId: string | null;
     role: string;
     team: string;
     legalHold: boolean;
@@ -162,7 +229,7 @@ function toScimUser(
     schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"],
     id: user.id,
     userName: user.username,
-    ...(user.externalId ? { externalId: user.externalId } : {}),
+    ...(user.scimExternalId ? { externalId: user.scimExternalId } : {}),
     active: user.role !== "disabled" && !user.role.startsWith("disabled:"),
     emails: user.email ? [{ value: user.email, primary: true }] : [],
     name: { formatted: user.username },
@@ -365,7 +432,7 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
 
       const body = request.body as Record<string, unknown>;
       const userName = body.userName as string | undefined;
-      const externalId = body.externalId as string | undefined;
+      const externalId = scimExternalId(body.externalId);
       const active = body.active !== false; // default true
       const emails = body.emails as Array<{ value: string; primary?: boolean }> | undefined;
       if (!userName) {
@@ -379,7 +446,7 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
         .where(eq(schema.users.username, userName));
 
       if (existing) {
-        return reply.status(409).send(scimError(409, "User already exists"));
+        return reply.status(409).send(scimError(409, "User already exists", "uniqueness"));
       }
 
       const id = randomUUID();
@@ -398,9 +465,9 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
       // commits (issue #927). MAX_USERS binds provisioning too (issue #966):
       // the locked count and the insert share one transaction, same as the
       // register route, so concurrent creates can't overshoot the cap. The
-      // guard is unqualified so it also covers the (auth_provider,
-      // external_id) index (issue #969): a retry under a fresh userName but
-      // the same externalId is the same identity, and gets the same 409.
+      // guard is unqualified so it also covers the SCIM externalId index
+      // (issues #969, #1510): a retry under a fresh userName but the same
+      // externalId is the same identity, and gets the same 409.
       const inserted = await db.transaction(async (tx) => {
         if (await userLimitReached(tx)) return "limit" as const;
         return tx
@@ -409,7 +476,7 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
             id,
             username: userName,
             email,
-            externalId: externalId ?? null,
+            scimExternalId: externalId,
             role: active ? "user" : "disabled",
             team: teamId,
             authProvider: "scim",
@@ -425,7 +492,7 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
       }
 
       if (!inserted.rowCount) {
-        return reply.status(409).send(scimError(409, "User already exists"));
+        return reply.status(409).send(scimError(409, "User already exists", "uniqueness"));
       }
 
       await auditLog(
@@ -444,7 +511,7 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
         id,
         username: userName,
         email,
-        externalId: externalId ?? null,
+        scimExternalId: externalId,
         role: active ? "user" : "disabled",
         team: teamId,
         legalHold: false,
@@ -521,7 +588,7 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
           users = await db
             .select()
             .from(schema.users)
-            .where(eq(schema.users.externalId, parsed.value));
+            .where(eq(schema.users.scimExternalId, parsed.value));
         } else {
           return reply
             .status(400)
@@ -570,7 +637,6 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
 
       const body = request.body as Record<string, unknown>;
       const userName = body.userName as string | undefined;
-      const externalId = body.externalId as string | undefined;
       const active = body.active !== false;
       const emails = body.emails as Array<{ value: string; primary?: boolean }> | undefined;
 
@@ -585,13 +651,13 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
           .from(schema.users)
           .where(eq(schema.users.username, userName));
         if (conflict && conflict.id !== id) {
-          return reply.status(409).send(scimError(409, "userName already taken"));
+          return reply.status(409).send(scimError(409, "userName already taken", "uniqueness"));
         }
         updates.username = userName;
       }
 
-      if (externalId !== undefined) {
-        updates.externalId = externalId;
+      if (body.externalId !== undefined) {
+        updates.scimExternalId = scimExternalId(body.externalId);
       }
 
       const email = emails?.find((e) => e.primary)?.value ?? emails?.[0]?.value;
@@ -604,20 +670,19 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
         updates.role = restoredScimRole(existing.role);
       } else if (!active) {
         updates.role = canonicalDisabledScimRole(existing.role);
-        if (!isDisabledRole(existing.role)) {
-          // Revoke all sessions when transitioning from active to disabled.
-          await db.delete(schema.sessions).where(eq(schema.sessions.userId, id));
-        }
       }
+      // Revoke all sessions when transitioning from active to disabled.
+      const revokeSessions = !active && !isDisabledRole(existing.role);
 
       // The pre-check above can't close the race: two concurrent renames
       // onto the same userName both pass it before either UPDATE commits
       // (issue #968), so the loser's 23505 maps to the pre-check's 409.
+      // externalId has no pre-check; its collisions always land here.
       try {
-        await db.update(schema.users).set(updates).where(eq(schema.users.id, id));
+        await updateScimUser(id, updates, revokeSessions);
       } catch (err) {
         if (isUniqueViolation(err)) {
-          return reply.status(409).send(scimError(409, "userName already taken"));
+          return reply.status(409).send(userUpdateConflict(err, request.log));
         }
         throw err;
       }
@@ -634,7 +699,11 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
         {
           userId: id,
           username: updated.username,
-          changes: Object.keys(updates).filter((k) => k !== "updatedAt"),
+          // Named as SCIM attributes, as PATCH logs its paths, so audit
+          // searches for externalId changes keep working after #1510.
+          changes: Object.keys(updates)
+            .filter((k) => k !== "updatedAt")
+            .map((k) => (k === "scimExternalId" ? "externalId" : k)),
         },
         request.ip,
         request.id,
@@ -683,6 +752,7 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const updates: Record<string, unknown> = { updatedAt: new Date() };
+      let revokeSessions = false;
 
       for (const op of operations) {
         const opType = op.op.toLowerCase();
@@ -702,16 +772,14 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
               updates.role = restoredScimRole(existing.role);
             } else if (!active) {
               updates.role = canonicalDisabledScimRole(existing.role);
-              if (!isDisabledRole(existing.role)) {
-                await db.delete(schema.sessions).where(eq(schema.sessions.userId, id));
-              }
+              revokeSessions = !isDisabledRole(existing.role);
             }
           }
 
           if (op.path === "userName") {
             updates.username = op.value as string;
           } else if (op.path === "externalId") {
-            updates.externalId = op.value as string;
+            updates.scimExternalId = scimExternalId(op.value);
           } else if (op.path === "emails" || op.path === 'emails[type eq "work"].value') {
             const emails = Array.isArray(op.value)
               ? (op.value as Array<{ value: string; primary?: boolean }>)
@@ -725,7 +793,9 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
           if (!op.path && typeof op.value === "object" && op.value !== null) {
             const valObj = op.value as Record<string, unknown>;
             if (valObj.userName) updates.username = valObj.userName as string;
-            if (valObj.externalId !== undefined) updates.externalId = valObj.externalId as string;
+            if (valObj.externalId !== undefined) {
+              updates.scimExternalId = scimExternalId(valObj.externalId);
+            }
             if (valObj.emails) {
               const emails = valObj.emails as Array<{ value: string; primary?: boolean }>;
               updates.email = emails.find((e) => e.primary)?.value ?? emails[0]?.value;
@@ -733,7 +803,7 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
           }
         } else if (opType === "remove") {
           if (op.path === "externalId") {
-            updates.externalId = null;
+            updates.scimExternalId = null;
           } else if (op.path === "emails") {
             updates.email = null;
           }
@@ -744,10 +814,10 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
       // #968 even a sequential rename onto a taken name surfaced the 23505
       // as a 500. The 409 aborts the whole patch, nothing was applied.
       try {
-        await db.update(schema.users).set(updates).where(eq(schema.users.id, id));
+        await updateScimUser(id, updates, revokeSessions);
       } catch (err) {
         if (isUniqueViolation(err)) {
-          return reply.status(409).send(scimError(409, "userName already taken"));
+          return reply.status(409).send(userUpdateConflict(err, request.log));
         }
         throw err;
       }
@@ -849,7 +919,7 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
         .where(eq(schema.teams.name, displayName));
 
       if (existing) {
-        return reply.status(409).send(scimError(409, "Group already exists"));
+        return reply.status(409).send(scimError(409, "Group already exists", "uniqueness"));
       }
 
       const id = randomUUID();
@@ -870,7 +940,7 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
         .onConflictDoNothing();
 
       if (!inserted.rowCount) {
-        return reply.status(409).send(scimError(409, "Group already exists"));
+        return reply.status(409).send(scimError(409, "Group already exists", "uniqueness"));
       }
 
       // Assign members to the team
@@ -1015,55 +1085,71 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
 
       const body = request.body as Record<string, unknown>;
       const displayName = (body.displayName as string | undefined)?.trim();
-      const members = body.members as Array<{ value: string }> | undefined;
 
       if (body.displayName !== undefined && !displayName) {
         return reply.status(400).send(scimError(400, "displayName cannot be empty"));
       }
-      if (displayName && displayName !== existing.name) {
+      // RFC 7643 2.5 treats null and an empty array as the same state, and PUT
+      // replaces, so null clears the group, as it does on POST. Anything else
+      // that isn't an array is refused before anything writes: iterating it
+      // used to throw after the rename and the move-out had committed (#1682).
+      const rawMembers = body.members === null ? [] : body.members;
+      if (rawMembers !== undefined && !Array.isArray(rawMembers)) {
+        return reply.status(400).send(scimError(400, "members must be an array"));
+      }
+      const members = rawMembers as Array<{ value: string }> | undefined;
+      const renames = displayName !== undefined && displayName !== existing.name;
+      if (renames) {
         // Check for name conflict
         const [conflict] = await db
           .select()
           .from(schema.teams)
           .where(eq(schema.teams.name, displayName));
         if (conflict && conflict.id !== id) {
-          return reply.status(409).send(scimError(409, "Group name already taken"));
-        }
-        // The pre-check can't close the race: two concurrent renames onto
-        // the same displayName both pass it before either UPDATE commits
-        // (issue #968), so the loser's 23505 maps to the pre-check's 409.
-        try {
-          await db.update(schema.teams).set({ name: displayName }).where(eq(schema.teams.id, id));
-        } catch (err) {
-          if (isUniqueViolation(err)) {
-            return reply.status(409).send(scimError(409, "Group name already taken"));
-          }
-          throw err;
+          return reply.status(409).send(scimError(409, "Group name already taken", "uniqueness"));
         }
       }
 
-      // Replace membership: remove all current members, add new ones
-      if (members !== undefined) {
-        // Find the default team to move removed members to
-        const [defaultTeam] = await db
-          .select()
-          .from(schema.teams)
-          .where(eq(schema.teams.name, "Default"));
-        const fallbackTeamId = defaultTeam?.id ?? "default-team-00000000";
+      // All or nothing. The rename and both membership steps used to write
+      // straight to the database, so a failure after the rename left the
+      // group renamed and emptied behind a 500 (#1682).
+      try {
+        await db.transaction(async (tx) => {
+          if (renames) {
+            await tx.update(schema.teams).set({ name: displayName }).where(eq(schema.teams.id, id));
+          }
 
-        // Move current members out of this team
-        await db
-          .update(schema.users)
-          .set({ team: fallbackTeamId, updatedAt: new Date() })
-          .where(eq(schema.users.team, id));
+          // Replace membership: remove all current members, add new ones
+          if (members !== undefined) {
+            // Find the default team to move removed members to
+            const [defaultTeam] = await tx
+              .select()
+              .from(schema.teams)
+              .where(eq(schema.teams.name, "Default"));
+            const fallbackTeamId = defaultTeam?.id ?? "default-team-00000000";
 
-        // Add new members
-        for (const member of members) {
-          await db
-            .update(schema.users)
-            .set({ team: id, updatedAt: new Date() })
-            .where(eq(schema.users.id, member.value));
-        }
+            // Move current members out of this team
+            await tx
+              .update(schema.users)
+              .set({ team: fallbackTeamId, updatedAt: new Date() })
+              .where(eq(schema.users.team, id));
+
+            // Add new members
+            for (const member of members) {
+              await tx
+                .update(schema.users)
+                .set({ team: id, updatedAt: new Date() })
+                .where(eq(schema.users.id, member.value));
+            }
+          }
+        });
+      } catch (err) {
+        // The pre-check can't close the race: two concurrent renames onto
+        // the same displayName both pass it before either UPDATE commits
+        // (issue #968), so the loser's 23505 maps to the pre-check's 409.
+        const conflict = groupWriteConflict(err, request.log, id);
+        if (conflict) return reply.status(409).send(conflict);
+        throw err;
       }
 
       const [updatedTeam] = await db.select().from(schema.teams).where(eq(schema.teams.id, id));
@@ -1104,88 +1190,93 @@ export async function registerScimRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(404).send(scimError(404, "Group not found"));
       }
 
-      const body = request.body as {
-        schemas?: string[];
-        Operations?: Array<{
-          op: string;
-          path?: string;
-          value?: unknown;
-        }>;
-      };
+      const body = request.body as { schemas?: string[]; Operations?: ScimPatchOp[] };
 
       const operations = body.Operations ?? [];
 
-      for (const op of operations) {
-        const opType = op.op.toLowerCase();
+      // Reject rather than skip an empty rename: a silent no-op leaves the IdP
+      // thinking it applied while the team keeps its old name (#988). Checked
+      // before any operation writes, so nothing is half-applied.
+      const emptyRename = operations.some((op) => isGroupRename(op) && !groupRenameTarget(op));
+      if (emptyRename) {
+        return reply.status(400).send(scimError(400, "displayName cannot be empty"));
+      }
 
-        if (opType === "add" && op.path === "members") {
-          const members = Array.isArray(op.value)
-            ? (op.value as Array<{ value: string }>)
-            : [op.value as { value: string }];
-          for (const member of members) {
-            await db
-              .update(schema.users)
-              .set({ team: id, updatedAt: new Date() })
-              .where(eq(schema.users.id, member.value));
-          }
-        } else if (opType === "remove" && op.path) {
-          // Parse path like: members[value eq "userId"]
-          const memberMatch = op.path.match(/^members\[value\s+eq\s+"([^"]+)"\]$/i);
-          if (memberMatch) {
-            const userId = memberMatch[1];
-            // Move removed member to default team
-            const [defaultTeam] = await db
-              .select()
-              .from(schema.teams)
-              .where(eq(schema.teams.name, "Default"));
-            const fallbackTeamId = defaultTeam?.id ?? "default-team-00000000";
-            await db
-              .update(schema.users)
-              .set({ team: fallbackTeamId, updatedAt: new Date() })
-              .where(and(eq(schema.users.id, userId), eq(schema.users.team, id)));
-          }
-        } else if (opType === "replace") {
-          if (op.path === "displayName") {
-            const newName = (op.value as string | undefined)?.trim();
-            if (!newName) {
-              // Reject rather than skip: a silent no-op leaves the IdP thinking
-              // the rename applied while the team keeps its old name (#988).
-              return reply.status(400).send(scimError(400, "displayName cannot be empty"));
-            }
-            // No conflict pre-check on this path, so before issue #968 a
-            // rename onto a taken name surfaced the 23505 as a 500.
-            try {
-              await db.update(schema.teams).set({ name: newName }).where(eq(schema.teams.id, id));
-            } catch (err) {
-              if (isUniqueViolation(err)) {
-                return reply.status(409).send(scimError(409, "Group name already taken"));
+      // All or nothing. Each operation used to write straight to the database,
+      // so member changes from earlier operations stayed committed when a
+      // later rename collided, while the IdP read the error as the whole
+      // request rejected (#1543). The transaction rolls them back instead.
+      try {
+        await db.transaction(async (tx) => {
+          for (const op of operations) {
+            const opType = op.op.toLowerCase();
+
+            if (opType === "add" && op.path === "members") {
+              const members = Array.isArray(op.value)
+                ? (op.value as Array<{ value: string }>)
+                : [op.value as { value: string }];
+              for (const member of members) {
+                await tx
+                  .update(schema.users)
+                  .set({ team: id, updatedAt: new Date() })
+                  .where(eq(schema.users.id, member.value));
               }
-              throw err;
-            }
-          } else if (op.path === "members") {
-            // Full member replacement
-            const members = Array.isArray(op.value) ? (op.value as Array<{ value: string }>) : [];
-            const [defaultTeam] = await db
-              .select()
-              .from(schema.teams)
-              .where(eq(schema.teams.name, "Default"));
-            const fallbackTeamId = defaultTeam?.id ?? "default-team-00000000";
+            } else if (opType === "remove" && op.path) {
+              // Parse path like: members[value eq "userId"]
+              const memberMatch = op.path.match(/^members\[value\s+eq\s+"([^"]+)"\]$/i);
+              if (memberMatch) {
+                const userId = memberMatch[1];
+                // Move removed member to default team
+                const [defaultTeam] = await tx
+                  .select()
+                  .from(schema.teams)
+                  .where(eq(schema.teams.name, "Default"));
+                const fallbackTeamId = defaultTeam?.id ?? "default-team-00000000";
+                await tx
+                  .update(schema.users)
+                  .set({ team: fallbackTeamId, updatedAt: new Date() })
+                  .where(and(eq(schema.users.id, userId), eq(schema.users.team, id)));
+              }
+            } else if (opType === "replace") {
+              if (isGroupRename(op)) {
+                await tx
+                  .update(schema.teams)
+                  .set({ name: groupRenameTarget(op) })
+                  .where(eq(schema.teams.id, id));
+              } else if (op.path === "members") {
+                // Full member replacement
+                const members = Array.isArray(op.value)
+                  ? (op.value as Array<{ value: string }>)
+                  : [];
+                const [defaultTeam] = await tx
+                  .select()
+                  .from(schema.teams)
+                  .where(eq(schema.teams.name, "Default"));
+                const fallbackTeamId = defaultTeam?.id ?? "default-team-00000000";
 
-            // Remove all current members
-            await db
-              .update(schema.users)
-              .set({ team: fallbackTeamId, updatedAt: new Date() })
-              .where(eq(schema.users.team, id));
+                // Remove all current members
+                await tx
+                  .update(schema.users)
+                  .set({ team: fallbackTeamId, updatedAt: new Date() })
+                  .where(eq(schema.users.team, id));
 
-            // Add new members
-            for (const member of members) {
-              await db
-                .update(schema.users)
-                .set({ team: id, updatedAt: new Date() })
-                .where(eq(schema.users.id, member.value));
+                // Add new members
+                for (const member of members) {
+                  await tx
+                    .update(schema.users)
+                    .set({ team: id, updatedAt: new Date() })
+                    .where(eq(schema.users.id, member.value));
+                }
+              }
             }
           }
-        }
+        });
+      } catch (err) {
+        // No conflict pre-check on the rename path, so before issue #968 a
+        // rename onto a taken name surfaced the 23505 as a 500.
+        const conflict = groupWriteConflict(err, request.log, id);
+        if (conflict) return reply.status(409).send(conflict);
+        throw err;
       }
 
       const [updatedTeam] = await db.select().from(schema.teams).where(eq(schema.teams.id, id));

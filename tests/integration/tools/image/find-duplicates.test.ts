@@ -6,7 +6,9 @@
  */
 
 import sharp from "sharp";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { UNDECODABLE_IMAGE_MESSAGE } from "../../../../apps/api/src/lib/image-error.js";
+import { logger } from "../../../../apps/api/src/lib/logger.js";
 import { fixtures, readFixture } from "../../../fixtures/index.js";
 import {
   buildTestApp,
@@ -1403,20 +1405,53 @@ describe("Find Duplicates", () => {
       { name: "file", filename: "sideways.jpg", contentType: "image/jpeg", content: broken },
     ]);
 
-    const res = await app.inject({
-      method: "POST",
-      url: "/api/v1/tools/image/find-duplicates",
-      headers: { authorization: `Bearer ${adminToken}`, "content-type": contentType },
-      body,
-    });
+    // A corrupt upload is expected input (#1492): the user gets the
+    // classifier's message, the server gets an info line with the filename
+    // (the classifier logs the probe result itself), and nothing at warn or
+    // error, so the autoOrient warn just before stays the only warn.
+    const warnSpy = vi.spyOn(logger, "warn");
+    const infoSpy = vi.spyOn(logger, "info");
+    const errorSpy = vi.spyOn(logger, "error");
+    try {
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/v1/tools/image/find-duplicates",
+        headers: { authorization: `Bearer ${adminToken}`, "content-type": contentType },
+        body,
+      });
 
-    expect(res.statusCode).toBe(200);
-    const result = JSON.parse(res.body);
-    expect(result.totalImages).toBe(2);
-    expect(result.skippedFiles).toEqual([
-      { filename: "sideways.jpg", reason: "Failed to compute image hash" },
-    ]);
-    expect(result.duplicateGroups).toHaveLength(1);
+      expect(res.statusCode).toBe(200);
+      const result = JSON.parse(res.body);
+      expect(result.totalImages).toBe(2);
+      expect(result.skippedFiles).toEqual([
+        { filename: "sideways.jpg", reason: UNDECODABLE_IMAGE_MESSAGE },
+      ]);
+      expect(result.duplicateGroups).toHaveLength(1);
+
+      const isOurs = (call: unknown[]) =>
+        typeof call[1] === "string" && call[1].startsWith("find-duplicates:");
+      // the same file also gets the thumbnail info line (its JPEG re-encode
+      // fails too), so pin the skip line by its message
+      const skipLines = infoSpy.mock.calls.filter(
+        (call) => call[1] === "find-duplicates: skipping undecodable file",
+      );
+      expect(skipLines).toHaveLength(1);
+      expect(skipLines[0][0]).toMatchObject({
+        filename: "sideways.jpg",
+        err: expect.any(Error),
+        reason: UNDECODABLE_IMAGE_MESSAGE,
+      });
+      expect(warnSpy.mock.calls.filter(isOurs)).toHaveLength(0);
+      expect(errorSpy.mock.calls.filter(isOurs)).toHaveLength(0);
+      // the autoOrient warn for the same file is still there
+      expect(warnSpy.mock.calls.some((call) => String(call[1]).startsWith("autoOrient:"))).toBe(
+        true,
+      );
+    } finally {
+      warnSpy.mockRestore();
+      infoSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
   });
 
   it("answers 400 when hash failures leave fewer than 2 processable images", async () => {
@@ -1437,7 +1472,55 @@ describe("Find Duplicates", () => {
     const result = JSON.parse(res.body);
     expect(result.error).toContain("At least 2");
     expect(result.skippedFiles).toEqual([
-      { filename: "sideways.jpg", reason: "Failed to compute image hash" },
+      { filename: "sideways.jpg", reason: UNDECODABLE_IMAGE_MESSAGE },
     ]);
+  });
+
+  it("returns a null thumbnail, and says so in the log, when the JPEG encode fails but the hash succeeds", async () => {
+    // Sharp decodes and hashes this fine but refuses to JPEG-encode anything
+    // taller than 65535 px, so only the thumbnail step fails.
+    const tall = await sharp({
+      create: { width: 1, height: 70_000, channels: 3, background: { r: 40, g: 90, b: 200 } },
+    })
+      .png()
+      .toBuffer();
+    await expect(sharp(tall).jpeg().toBuffer()).rejects.toThrow(/too large for the JPEG/);
+    await expect(sharp(tall).resize(9, 8, { fit: "fill" }).raw().toBuffer()).resolves.toBeDefined();
+
+    const { body, contentType } = createMultipartPayload([
+      { name: "file", filename: "tall1.png", contentType: "image/png", content: tall },
+      { name: "file", filename: "tall2.png", contentType: "image/png", content: tall },
+    ]);
+
+    const infoSpy = vi.spyOn(logger, "info");
+    try {
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/v1/tools/image/find-duplicates",
+        headers: { authorization: `Bearer ${adminToken}`, "content-type": contentType },
+        body,
+      });
+
+      expect(res.statusCode).toBe(200);
+      const result = JSON.parse(res.body);
+      expect(result.skippedFiles).toBeUndefined();
+      expect(result.duplicateGroups).toHaveLength(1);
+      expect(
+        result.duplicateGroups[0].files.map((f: { thumbnail: string | null }) => f.thumbnail),
+      ).toEqual([null, null]);
+
+      const lines = infoSpy.mock.calls.filter(
+        (call) => typeof call[1] === "string" && call[1].startsWith("find-duplicates:"),
+      );
+      expect(lines).toHaveLength(2);
+      expect(lines[0][0]).toMatchObject({
+        filename: "tall1.png",
+        format: "png",
+        err: expect.any(Error),
+      });
+      expect(lines[0][1]).toBe("find-duplicates: thumbnail failed, returning null");
+    } finally {
+      infoSpy.mockRestore();
+    }
   });
 });

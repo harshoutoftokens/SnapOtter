@@ -1,6 +1,7 @@
 import {
   ANALYTICS_EVENTS,
   apiToolPath,
+  type FeedbackErrorCategory,
   FILE_NOTES_ALL_FILES,
   PYTHON_SIDECAR_TOOLS,
   TOOLS,
@@ -12,7 +13,11 @@ import { track } from "@/lib/analytics";
 import { formatHeaders, parseApiError } from "@/lib/api";
 import { appUrl, resolveServerUrls, serverUrl } from "@/lib/app-url";
 import { featureNotInstalledMessage } from "@/lib/bundle-i18n";
-import { FRAME_HANDLING_FAILED, type ProgressFrame } from "@/lib/progress-frames";
+import {
+  FRAME_HANDLING_FAILED,
+  failedFrameMessage,
+  type ProgressFrame,
+} from "@/lib/progress-frames";
 import { asNotesMap, parseFileNotesHeader, pickResultNotes } from "@/lib/result-notes";
 import { MULTI_FILE_TOOLS } from "@/lib/tool-display-modes";
 import { getToolName } from "@/lib/tool-i18n";
@@ -485,7 +490,7 @@ export function useToolProcessor(toolId: string) {
               // cannot replace this specific error with a generic one.
               xhrRef.current?.abort();
               clearActiveJob();
-              const message = data.error || "Processing failed";
+              const message = failedFrameMessage(data, "Processing failed");
               settleProcessingEntries(message);
               setError(message);
               setProcessing(false);
@@ -704,11 +709,12 @@ export function useToolProcessor(toolId: string) {
       // status === "processing" and gates the failure screen on
       // status === "failed", so an unsettled entry pulses on the untouched
       // original forever (#799, the single-file twin of #798's failRun).
-      const failEntry = (message: string) => {
+      const failEntry = (message: string, category?: FeedbackErrorCategory) => {
         if (useFileStore.getState().entries[capturedIndex]?.status === "processing") {
           useFileStore.getState().updateEntry(capturedIndex, {
             status: "failed",
             error: message,
+            errorCategory: category ?? null,
           });
         }
       };
@@ -789,7 +795,7 @@ export function useToolProcessor(toolId: string) {
           // the same thing to the user, in their language (#1341).
           if (xhr.status === 413) message = t.errors.fileTooLarge;
           setError(message);
-          failEntry(message);
+          failEntry(message, xhr.status === 413 ? "upload_error" : undefined);
         }
 
         setProcessing(false);
@@ -967,7 +973,7 @@ export function useToolProcessor(toolId: string) {
         setProgress(IDLE_PROGRESS);
       };
 
-      const failRun = (message: string, reason: string) => {
+      const failRun = (message: string, reason: string, category?: FeedbackErrorCategory) => {
         // Entries were set to "processing" at kickoff (the reset loop above). A
         // whole-run failure that never reached settleFromZip must settle them,
         // or the result pane keeps pulsing on the stale original because the
@@ -975,7 +981,7 @@ export function useToolProcessor(toolId: string) {
         const runEntries = useFileStore.getState().entries;
         for (let i = 0; i < runEntries.length; i++) {
           if (runEntries[i]?.status === "processing") {
-            updateEntry(i, { status: "failed", error: message });
+            updateEntry(i, { status: "failed", error: message, errorCategory: category ?? null });
           }
         }
         setError(message);
@@ -1269,7 +1275,11 @@ export function useToolProcessor(toolId: string) {
           if (xhr.status === 413) errorMsg = t.errors.fileTooLarge;
           // "Canceled" (not the route's message) so the existing i18n
           // mapping renders it localized.
-          failRun(serverCanceled ? "Canceled" : errorMsg, reason);
+          failRun(
+            serverCanceled ? "Canceled" : errorMsg,
+            reason,
+            !serverCanceled && xhr.status === 413 ? "upload_error" : undefined,
+          );
         })();
       };
 

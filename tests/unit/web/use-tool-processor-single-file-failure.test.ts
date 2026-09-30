@@ -169,6 +169,8 @@ describe("useToolProcessor single-file failure settle (#799)", () => {
     expect(useFileStore.getState().entries[0]).toMatchObject({
       status: "failed",
       error: en.errors.fileTooLarge,
+      // The message is translated, so feedback reads the cause from here (#1596).
+      errorCategory: "upload_error",
     });
     expect(useFileStore.getState().error).toBe(en.errors.fileTooLarge);
 
@@ -187,6 +189,7 @@ describe("useToolProcessor single-file failure settle (#799)", () => {
     expect(useFileStore.getState().entries[0]).toMatchObject({
       status: "failed",
       error: "Processing failed: 500",
+      errorCategory: null,
     });
     expect(useFileStore.getState().processing).toBe(false);
 
@@ -469,6 +472,28 @@ describe("useToolProcessor single-file failure settle (#799)", () => {
     expect(useFileStore.getState().entries[2].status).toBe("pending");
 
     hook.unmount();
+  });
+
+  it("shows the operator hint a failed frame carries (#1432)", () => {
+    const { unmount } = startRun();
+
+    act(() => {
+      sendSingleFrame({
+        phase: "failed",
+        percent: 0,
+        error: "PDF processing is unavailable on this server because qpdf could not be started.",
+        code: "ENGINE_UNAVAILABLE",
+        details: "Check QPDF_PATH: it must point at an executable qpdf binary.",
+      });
+    });
+
+    const expected =
+      "PDF processing is unavailable on this server because qpdf could not be started.: " +
+      "Check QPDF_PATH: it must point at an executable qpdf binary.";
+    expect(useFileStore.getState().entries[0]).toMatchObject({ status: "failed", error: expected });
+    expect(useFileStore.getState().error).toBe(expected);
+
+    unmount();
   });
 
   it("falls back to a generic message when the failed frame carries no error", () => {

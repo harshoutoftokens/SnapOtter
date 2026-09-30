@@ -7,8 +7,9 @@
  * Every failure case checks all three places a file lands: the user_files rows
  * and the users.storage_used counter (this fork's own database), and the blobs
  * this request wrote. The blobs are tracked by name through a saveFile wrapper
- * rather than by counting the folder: FILES_STORAGE_PATH isn't per-fork, so
- * other test files write and delete there while this one runs (#1471).
+ * rather than by counting the folder: the folder is this file's own since
+ * #1471, but the tests in this file share it, and a name says which blob is
+ * which.
  */
 import { access } from "node:fs/promises";
 import { eq, inArray, sql } from "drizzle-orm";
@@ -20,7 +21,15 @@ const hooks = vi.hoisted(() => ({
   failSaveOnCall: 0,
   /** When set, sanitizeSvg throws a non-400 error (the handler's 500 branch). */
   svgUnexpectedError: false,
+  /** 1-based saveFile call whose blob then refuses to be deleted, or 0 for none. */
+  failDeleteOf: 0,
+  reportError: vi.fn(),
 }));
+
+vi.mock("../../../apps/api/src/lib/error-report.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../apps/api/src/lib/error-report.js")>();
+  return { ...actual, reportError: hooks.reportError };
+});
 
 vi.mock("../../../apps/api/src/lib/file-storage.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../../apps/api/src/lib/file-storage.js")>();
@@ -33,6 +42,12 @@ vi.mock("../../../apps/api/src/lib/file-storage.js", async (importOriginal) => {
       const storedName = await actual.saveFile(buffer, originalName);
       hooks.savedNames.push(storedName);
       return storedName;
+    },
+    deleteStoredFile: async (storedName: string) => {
+      if (hooks.failDeleteOf && storedName === hooks.savedNames[hooks.failDeleteOf - 1]) {
+        throw Object.assign(new Error("simulated EBUSY on delete"), { code: "EBUSY" });
+      }
+      return actual.deleteStoredFile(storedName);
     },
   };
 });
@@ -71,7 +86,6 @@ const SMALL_SVG = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><rect/></
 let testApp: TestApp;
 let adminToken: string;
 let adminId: string;
-let adminTeam: string;
 /** Rows and blobs the success cases keep, removed in afterAll. */
 const keptIds: string[] = [];
 const keptBlobs: string[] = [];
@@ -80,11 +94,10 @@ beforeAll(async () => {
   testApp = await buildTestApp();
   adminToken = await loginAsAdmin(testApp.app);
   const [admin] = await db
-    .select({ id: schema.users.id, team: schema.users.team })
+    .select({ id: schema.users.id })
     .from(schema.users)
     .where(eq(schema.users.username, "admin"));
   adminId = admin.id;
-  adminTeam = admin.team;
 }, 30_000);
 
 afterAll(async () => {
@@ -98,14 +111,13 @@ beforeEach(() => {
   hooks.savedNames.length = 0;
   hooks.failSaveOnCall = 0;
   hooks.svgUnexpectedError = false;
+  hooks.failDeleteOf = 0;
+  hooks.reportError.mockReset();
 });
 
 afterEach(async () => {
   vi.restoreAllMocks();
-  await db
-    .update(schema.users)
-    .set({ storageQuota: null, team: adminTeam })
-    .where(eq(schema.users.id, adminId));
+  await db.update(schema.users).set({ storageQuota: null }).where(eq(schema.users.id, adminId));
   await db.update(schema.teams).set({ storageQuota: null });
 });
 
@@ -187,9 +199,6 @@ describe("multi-file library upload is all-or-nothing (#1342)", () => {
       .select({ id: schema.teams.id })
       .from(schema.teams)
       .where(eq(schema.teams.name, "Default"));
-    // users.team holds a team id for users created through the API; the
-    // bootstrap admin keeps the column default, so point it at the real row.
-    await db.update(schema.users).set({ team: team.id }).where(eq(schema.users.id, adminId));
     // Summed the way checkStorageQuota does: other users in this fork's
     // database may share the team.
     const [{ total }] = await db
@@ -279,5 +288,44 @@ describe("multi-file library upload is all-or-nothing (#1342)", () => {
     });
     expect(hooks.savedNames).toHaveLength(2);
     expect(await survivingBlobs()).toEqual(hooks.savedNames);
+  });
+});
+
+// #1472: once the request has failed, nothing points at a staged blob. A
+// discard that can't delete it is a storage leak, so it has to be reported,
+// not left to a warning.
+describe("a staged blob that can't be discarded", () => {
+  it("is reported on its own, the rest are still discarded, and the client gets the original refusal", async () => {
+    const before = await dbState();
+    hooks.failDeleteOf = 1;
+
+    try {
+      const res = await upload([
+        png(),
+        jpg(),
+        { name: "big.bin", content: OVER_LIMIT, type: "application/octet-stream" },
+      ]);
+
+      expect(res.statusCode).toBe(413);
+      expect(await dbState()).toEqual(before);
+      expect(hooks.savedNames).toHaveLength(2);
+      expect(await survivingBlobs()).toEqual([hooks.savedNames[0]]);
+      expect(hooks.reportError).toHaveBeenCalledTimes(1);
+      expect(hooks.reportError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          code: "STAGED_DISCARD_FAILED",
+          cause: expect.objectContaining({ code: "EBUSY" }),
+        }),
+        expect.objectContaining({
+          source: "http",
+          route: "/api/v1/files/upload",
+          method: "POST",
+          subsystem: "upload-storage",
+        }),
+      );
+    } finally {
+      hooks.failDeleteOf = 0;
+      await Promise.all(hooks.savedNames.map((name) => deleteStoredFile(name)));
+    }
   });
 });

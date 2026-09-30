@@ -1,10 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, statfs, unlink, writeFile } from "node:fs/promises";
+import {
+  type FileHandle,
+  mkdir,
+  open,
+  readFile,
+  statfs,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { basename, extname, isAbsolute, join } from "node:path";
 import type { Readable } from "node:stream";
 import type { S3StorageModule } from "@snapotter/enterprise";
 import { CAMERA_RAW_INPUTS, SafeError } from "@snapotter/shared";
 import { env } from "../config.js";
+import { logger } from "./logger.js";
 
 const MIN_FREE_BYTES = 100 * 1024 * 1024;
 
@@ -144,6 +153,38 @@ export async function ensureStorageDir(): Promise<void> {
   storageReady = true;
 }
 
+/**
+ * Delete what a failed write left behind. A write that fails partway (the disk
+ * filling after the free-space check, an I/O error) leaves a partial file, and
+ * its name never reaches the caller, so nothing else could ever remove it
+ * (#1472). Only called once the file was created, so a delete that fails here
+ * leaves a real orphan: log it by name, with the write error behind it.
+ */
+async function removePartialWrite(
+  path: string,
+  storedName: string,
+  writeErr: unknown,
+): Promise<void> {
+  try {
+    await unlink(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    logger.error({ err, writeErr, storedName }, "Could not remove a partly written library file");
+  }
+}
+
+function storageWriteError(e: unknown): unknown {
+  if ((e as NodeJS.ErrnoException | null)?.code === "EACCES") {
+    return new SafeError("Storage directory is not writable", {
+      kind: "operational",
+      code: "EACCES",
+      statusCode: 503,
+      cause: e,
+    });
+  }
+  return e;
+}
+
 export async function saveFile(buffer: Buffer, originalName: string): Promise<string> {
   const storedName = generateStoredName(originalName);
   if (isS3Enabled()) {
@@ -153,17 +194,25 @@ export async function saveFile(buffer: Buffer, originalName: string): Promise<st
   }
   await ensureStorageDir();
   await assertDiskSpace(env.FILES_STORAGE_PATH);
+  const path = join(env.FILES_STORAGE_PATH, storedName);
+  // Create, then write. If creating fails (a read-only volume, no permission)
+  // nothing is on disk, and a cleanup would only log an orphan that doesn't
+  // exist. "wx" also means a write never lands on an existing file.
+  let handle: FileHandle;
   try {
-    await writeFile(join(env.FILES_STORAGE_PATH, storedName), buffer);
+    handle = await open(path, "wx");
   } catch (e) {
-    if (e instanceof Error && (e as NodeJS.ErrnoException).code === "EACCES") {
-      throw new SafeError("Storage directory is not writable", {
-        kind: "operational",
-        code: (e as NodeJS.ErrnoException).code,
-        statusCode: 503,
-      });
-    }
-    throw e;
+    throw storageWriteError(e);
+  }
+  try {
+    await handle.writeFile(buffer);
+    await handle.close();
+  } catch (e) {
+    // The write error is the one the caller needs; a close failing on top of
+    // it adds nothing.
+    await handle.close().catch(() => {});
+    await removePartialWrite(path, storedName, e);
+    throw storageWriteError(e);
   }
   return storedName;
 }
@@ -214,10 +263,32 @@ export async function deleteStoredFile(storedName: string): Promise<void> {
     await s3.deleteObject(storedName);
     return;
   }
+  await unlinkStored(join(env.FILES_STORAGE_PATH, storedName));
+}
+
+/**
+ * Remove a stored file or thumbnail. "Already gone" is fine; anything else
+ * reaches the caller. Swallowing every error let a delete that failed on
+ * permissions look like one that worked, and the caller then dropped the DB
+ * row, orphaning the file for good (#1455). A permissions or read-only fault
+ * becomes the same 503 the save path raises.
+ */
+async function unlinkStored(path: string): Promise<void> {
   try {
-    await unlink(join(env.FILES_STORAGE_PATH, storedName));
-  } catch {
-    // File already gone
+    await unlink(path);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return;
+    if (code === "EACCES" || code === "EPERM" || code === "EROFS") {
+      // The path and errno stay on `cause` for the logs; the message is shown to users.
+      throw new SafeError("Storage directory is not writable", {
+        kind: "operational",
+        code,
+        statusCode: 503,
+        cause: e,
+      });
+    }
+    throw e;
   }
 }
 
@@ -287,9 +358,5 @@ export async function deleteThumbnail(storedName: string): Promise<void> {
     await s3.deleteThumbnail(storedName);
     return;
   }
-  try {
-    await unlink(thumbPath(storedName));
-  } catch {
-    // Thumbnail may not exist
-  }
+  await unlinkStored(thumbPath(storedName));
 }

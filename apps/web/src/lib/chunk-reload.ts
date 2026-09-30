@@ -20,11 +20,14 @@
  * beforeunload is the first step of every cross-document navigation. The
  * listener costs Firefox's back/forward cache for these pages; in-app
  * navigation is pushState, so only cross-document history pays for it.
+ * iOS Safari skips beforeunload, so a cross-document `navigate` event from
+ * the Navigation API starts the same window there (#1479).
  */
 
 export const CHUNK_RELOAD_GUARD_KEY = "snapotter-chunk-reload-at";
 export const CHUNK_RELOAD_GUARD_MS = 30_000;
-// How long after beforeunload a chunk failure is blamed on the navigation.
+// How long after beforeunload (or a cross-document `navigate`) a chunk
+// failure is blamed on the navigation.
 // There is no event for a cancelled leave, so this is what ends it.
 export const LEAVING_WINDOW_MS = 10_000;
 
@@ -44,12 +47,47 @@ function markReloadedNow(): void {
   }
 }
 
+// The exact errors left alone while the page was being left. Vite rethrows
+// the same object, so the boundary can tell them apart from real crashes
+// without matching engine-specific messages.
+const abortedByLeaving = new WeakSet<object>();
+
+/**
+ * True for a chunk error this handler left unhandled because the page was
+ * being left. Usually the browser aborted the import and nothing crashed:
+ * released builds sent these to Sentry with Firefox's and Safari's wording,
+ * never Chrome's (Chrome doesn't abort), in bursts as several imports died
+ * at once (#1480). It can't prove an abort, though, so reportRenderError
+ * delays the report rather than dropping it.
+ */
+export function isAbortedByLeaving(error: unknown): boolean {
+  return typeof error === "object" && error !== null && abortedByLeaving.has(error);
+}
+
 /** Returns an uninstall function (used by tests; the app installs once for its lifetime). */
 export function installChunkReloadHandler(
   reload: () => void = () => window.location.reload(),
 ): () => void {
   let leavingAt = Number.NEGATIVE_INFINITY;
   const onBeforeUnload = () => {
+    leavingAt = Date.now();
+  };
+  // iOS Safari never fires beforeunload (#1479), but it does fire the
+  // Navigation API's `navigate` before aborting the import. Only a
+  // cross-document destination leaves the page: router pushState is
+  // same-document, and a download keeps the page where it is.
+  const navigation = (window as Window & { navigation?: EventTarget }).navigation;
+  const onNavigate = (event: Event) => {
+    const { destination, downloadRequest } = event as Event & {
+      destination?: { sameDocument?: boolean; url?: string };
+      downloadRequest?: string | null;
+    };
+    if (destination?.sameDocument !== false) return;
+    // downloadRequest is null for a real navigation; a bare <a download> gives "".
+    if (downloadRequest != null) return;
+    // mailto: and other external schemes hand off to another app and the page
+    // stays; Chromium still fires a cross-document navigate for them.
+    if (!/^https?:/i.test(destination.url ?? "")) return;
     leavingAt = Date.now();
   };
   // A page restored from the back/forward cache is no longer being left.
@@ -59,7 +97,11 @@ export function installChunkReloadHandler(
   const onPreloadError = (event: Event) => {
     // Unhandled on purpose: if the leave is cancelled after all, the error
     // boundary shows the real chunk error rather than an undefined module.
-    if (Date.now() - leavingAt < LEAVING_WINDOW_MS) return;
+    if (Date.now() - leavingAt < LEAVING_WINDOW_MS) {
+      const { payload } = event as Event & { payload?: unknown };
+      if (typeof payload === "object" && payload !== null) abortedByLeaving.add(payload);
+      return;
+    }
     if (Date.now() - readLastReloadAt() < CHUNK_RELOAD_GUARD_MS) return;
     markReloadedNow();
     // Handled here: stop Vite from rethrowing into the error boundary.
@@ -69,9 +111,11 @@ export function installChunkReloadHandler(
   window.addEventListener("beforeunload", onBeforeUnload);
   window.addEventListener("pageshow", onPageShow);
   window.addEventListener("vite:preloadError", onPreloadError);
+  navigation?.addEventListener("navigate", onNavigate);
   return () => {
     window.removeEventListener("beforeunload", onBeforeUnload);
     window.removeEventListener("pageshow", onPageShow);
     window.removeEventListener("vite:preloadError", onPreloadError);
+    navigation?.removeEventListener("navigate", onNavigate);
   };
 }

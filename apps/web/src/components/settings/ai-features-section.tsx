@@ -258,6 +258,18 @@ function ImportBundleSection({ onImported }: { onImported: () => void }) {
         body: formData,
       });
 
+      // These two refusals are fixed by their status alone, so they get their
+      // own translated line (#1445).
+      if (res.status === 409 || res.status === 507) {
+        setFeedback({
+          type: "error",
+          message:
+            res.status === 409
+              ? t.settings.aiFeatures.importBusy
+              : t.settings.aiFeatures.importNoSpace,
+        });
+        return;
+      }
       if (!res.ok) {
         const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
         throw new Error(body.error || `Import failed: ${res.status}`);
@@ -272,7 +284,10 @@ function ImportBundleSection({ onImported }: { onImported: () => void }) {
       }
       onImported();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Unknown error";
+      // The import's reasons are specific and technical (a bad signature, a
+      // missing file in the archive) and carry no code to translate, so the
+      // detail stays inside the translated sentence.
+      const msg = err instanceof Error ? err.message : t.errors.generic;
       setFeedback({
         type: "error",
         message: format(t.settings.aiFeatures.importError, { error: msg }),

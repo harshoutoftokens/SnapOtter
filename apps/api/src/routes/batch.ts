@@ -23,7 +23,11 @@ import { type Pool, queueName, type ToolJobData, type ToolJobResult } from "../j
 import { autoOrient } from "../lib/auto-orient.js";
 import { type BatchFileNotes, compactFileNotes } from "../lib/batch-file-notes.js";
 import { getSecurityHeaders } from "../lib/csp.js";
-import { reportEngineUnavailable } from "../lib/engine-unavailable.js";
+import {
+  preFailureFaultFields,
+  reportEngineUnavailable,
+  sharedServerFault,
+} from "../lib/engine-unavailable.js";
 import { formatZodErrors, friendlyError, sharedFailureReason } from "../lib/errors.js";
 import { getFirstMissingBundleForTool } from "../lib/feature-status.js";
 import { validateImageBuffer } from "../lib/file-validation.js";
@@ -34,6 +38,7 @@ import {
   deleteObject,
   getObjectStream,
   putObject,
+  STORAGE_FAULT_CODES,
   workspaceHeadroomBytes,
 } from "../lib/object-storage.js";
 import { resolveOcrIngressSettings } from "../lib/ocr-capability.js";
@@ -61,10 +66,6 @@ type ParsedFile =
   | ({ kind: "path" } & SpooledMultipartFile);
 
 const formatMb = (bytes: number): string => `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-
-// Storage capacity failures answer 503 wherever they surface, so a client
-// keys on one status and code for "the instance is full" (#1161).
-const CAPACITY_CODES = new Set(["workspace-cap", "disk-free-floor"]);
 
 /**
  * The failure a finalize committed to the parent row before it rethrew, or
@@ -345,7 +346,14 @@ export async function registerBatchRoutes(app: FastifyInstance): Promise<void> {
 
           // ── Validate, decode, and upload each file ────────────────────
           const flowChildren: FlowJob[] = [];
-          const preFailures: Array<{ originalIndex: number; filename: string; error: string }> = [];
+          const preFailures: Array<{
+            originalIndex: number;
+            filename: string;
+            error: string;
+            statusCode?: number;
+            code?: string;
+            details?: string;
+          }> = [];
           // Flow index -> original upload index, consumed by batch-finalize so
           // fileResults keeps #645's index alignment across pre-failures.
           const fileIndexMap: number[] = [];
@@ -386,6 +394,7 @@ export async function registerBatchRoutes(app: FastifyInstance): Promise<void> {
                     originalIndex: i,
                     filename: file.filename,
                     error: err.message,
+                    ...preFailureFaultFields(err),
                   });
                   continue;
                 }
@@ -411,6 +420,7 @@ export async function registerBatchRoutes(app: FastifyInstance): Promise<void> {
                       originalIndex: i,
                       filename: file.filename,
                       error: err.message,
+                      ...preFailureFaultFields(err),
                     });
                     continue;
                   }
@@ -487,6 +497,7 @@ export async function registerBatchRoutes(app: FastifyInstance): Promise<void> {
                       originalIndex: i,
                       filename: file.filename,
                       error: err.message,
+                      ...preFailureFaultFields(err),
                     });
                     continue;
                   }
@@ -555,20 +566,42 @@ export async function registerBatchRoutes(app: FastifyInstance): Promise<void> {
             // All files failed validation. There is no flow to run, so no
             // finalize will ever publish a terminal frame; publish it here
             // (awaited and guarded, like the finalize's own writes) so a
-            // client that lost this response settles from SSE (#750).
+            // client that lost this response settles from SSE (#750). When
+            // they all failed on the same missing engine, that is the
+            // batch's failure: its status, code, and hint lead (#1432).
+            const shared = sharedServerFault(preFailures);
+            const errors = preFailures.map((f) => ({
+              filename: f.filename,
+              error: f.error,
+              ...(f.code && { code: f.code }),
+            }));
             await failBatchJob({
               jobId: parentId,
               totalFiles: files.length,
               completedFiles: files.length,
               failedFiles: files.length,
-              errors: preFailures.map((f) => ({ filename: f.filename, error: f.error })),
-              message: "All files failed processing",
+              // A blank-name entry is the run's own error to an SSE client
+              // (the worker finalize's #1161 convention), so one that lost
+              // this reply still sees the fault and its hint.
+              errors: shared
+                ? [
+                    ...errors,
+                    {
+                      filename: "",
+                      error: shared.details ? `${shared.error}: ${shared.details}` : shared.error,
+                    },
+                  ]
+                : errors,
+              message: shared?.error ?? "All files failed processing",
+              ...(shared && { code: shared.code }),
             }).catch((err) => {
               request.log.error({ err, jobId: parentId }, "all-prefail terminal write failed");
             });
-            return reply.status(422).send({
-              error: "All files failed processing",
-              errors: preFailures.map((f) => ({ filename: f.filename, error: f.error })),
+            return reply.status(shared?.statusCode ?? 422).send({
+              error: shared?.error ?? "All files failed processing",
+              ...(shared && { code: shared.code }),
+              ...(shared?.details && { details: shared.details }),
+              errors,
             });
           }
 
@@ -617,7 +650,10 @@ export async function registerBatchRoutes(app: FastifyInstance): Promise<void> {
             // row is what the sync client and API consumers must see (#1161).
             const failure = await settledFailure(parentId);
             if (!failure) throw err;
-            const status = failure.code && CAPACITY_CODES.has(failure.code) ? 503 : 500;
+            // Storage faults answer 503 wherever they surface, so a client
+            // keys on one status and code for "the instance can't store
+            // this" (#1161, #1421).
+            const status = failure.code && STORAGE_FAULT_CODES.has(failure.code) ? 503 : 500;
             return reply.status(status).send({
               error: failure.message,
               ...(failure.code ? { code: failure.code } : {}),

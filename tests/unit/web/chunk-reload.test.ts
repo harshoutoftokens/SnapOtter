@@ -19,8 +19,15 @@ import {
   CHUNK_RELOAD_GUARD_KEY,
   CHUNK_RELOAD_GUARD_MS,
   installChunkReloadHandler,
+  isAbortedByLeaving,
   LEAVING_WINDOW_MS,
 } from "@/lib/chunk-reload";
+
+function fireChunkErrorWith(payload: unknown): Event {
+  const event = Object.assign(new Event("vite:preloadError", { cancelable: true }), { payload });
+  window.dispatchEvent(event);
+  return event;
+}
 
 function fireChunkError(): Event {
   const event = new Event("vite:preloadError", { cancelable: true });
@@ -104,6 +111,36 @@ describe("installChunkReloadHandler", () => {
     getItem.mockRestore();
   });
 
+  describe("isAbortedByLeaving (#1480)", () => {
+    it("recognises exactly the error it left alone while leaving", () => {
+      startLeaving();
+      const aborted = new TypeError("error loading dynamically imported module: /assets/a.js");
+      fireChunkErrorWith(aborted);
+
+      expect(isAbortedByLeaving(aborted)).toBe(true);
+      // Same message, different object: a real failure elsewhere still counts.
+      expect(isAbortedByLeaving(new TypeError(aborted.message))).toBe(false);
+    });
+
+    it("does not mark an error the handler reloaded for", () => {
+      const stale = new TypeError("Importing a module script failed.");
+      fireChunkErrorWith(stale);
+
+      expect(reload).toHaveBeenCalledTimes(1);
+      expect(isAbortedByLeaving(stale)).toBe(false);
+    });
+
+    it("ignores payloads that are not objects", () => {
+      startLeaving();
+      expect(() => fireChunkErrorWith("string payload")).not.toThrow();
+      expect(() => fireChunkErrorWith(undefined)).not.toThrow();
+
+      expect(isAbortedByLeaving("string payload")).toBe(false);
+      expect(isAbortedByLeaving(undefined)).toBe(false);
+      expect(isAbortedByLeaving(null)).toBe(false);
+    });
+  });
+
   describe("while the page is being left (#912)", () => {
     it("does not reload, which would cancel the navigation", () => {
       startLeaving();
@@ -152,6 +189,99 @@ describe("installChunkReloadHandler", () => {
       expect(removed).toEqual(
         expect.arrayContaining(["beforeunload", "pageshow", "vite:preloadError"]),
       );
+      remove.mockRestore();
+      uninstall = installChunkReloadHandler(reload);
+    });
+  });
+
+  describe("a leave announced only by the Navigation API (#1479)", () => {
+    // iOS Safari never fires beforeunload, so on iPhone and iPad the handler
+    // used to reload and cancel the navigation. Verified in the iOS 27
+    // Simulator: `navigate` does fire, with a cross-document destination,
+    // before the import is aborted.
+    let navigation: EventTarget;
+
+    function navigate(init: {
+      sameDocument: boolean;
+      downloadRequest?: string | null;
+      url?: string;
+    }): void {
+      const event = Object.assign(new Event("navigate"), {
+        destination: {
+          sameDocument: init.sameDocument,
+          url: init.url ?? "https://snapotter.example/logout",
+        },
+        downloadRequest: init.downloadRequest ?? null,
+      });
+      navigation.dispatchEvent(event);
+    }
+
+    beforeEach(() => {
+      uninstall();
+      navigation = new EventTarget();
+      Object.defineProperty(window, "navigation", { value: navigation, configurable: true });
+      uninstall = installChunkReloadHandler(reload);
+    });
+
+    afterEach(() => {
+      Reflect.deleteProperty(window, "navigation");
+    });
+
+    it("does not reload after a cross-document navigation starts", () => {
+      navigate({ sameDocument: false });
+      vi.advanceTimersByTime(200);
+      const event = fireChunkError();
+
+      expect(reload).not.toHaveBeenCalled();
+      expect(event.defaultPrevented).toBe(false);
+    });
+
+    it("still reloads after an in-app (same-document) navigation", () => {
+      // React Router's pushState navigations fire `navigate` too; the page
+      // stays, so a chunk failure there is a real one.
+      navigate({ sameDocument: true });
+      fireChunkError();
+
+      expect(reload).toHaveBeenCalledTimes(1);
+    });
+
+    it("still reloads after a download, which does not leave the page", () => {
+      navigate({ sameDocument: false, downloadRequest: "result.zip" });
+      fireChunkError();
+
+      expect(reload).toHaveBeenCalledTimes(1);
+    });
+
+    it("still reloads after a bare <a download>, whose downloadRequest is an empty string", () => {
+      // ResultDownloadLink renders download="" (download={name ?? true}).
+      navigate({ sameDocument: false, downloadRequest: "" });
+      fireChunkError();
+
+      expect(reload).toHaveBeenCalledTimes(1);
+    });
+
+    it("still reloads after a mailto: link, which hands off to another app", () => {
+      // Chromium fires a cross-document navigate for mailto: while the page
+      // stays put (checked in Chromium 1.61's build; Firefox and WebKit don't).
+      navigate({ sameDocument: false, url: "mailto:contact@snapotter.com" });
+      fireChunkError();
+
+      expect(reload).toHaveBeenCalledTimes(1);
+    });
+
+    it("reloads again once the leaving window has passed", () => {
+      navigate({ sameDocument: false });
+      vi.advanceTimersByTime(LEAVING_WINDOW_MS + 1);
+      fireChunkError();
+
+      expect(reload).toHaveBeenCalledTimes(1);
+    });
+
+    it("stops listening to the Navigation API once uninstalled", () => {
+      const remove = vi.spyOn(navigation, "removeEventListener");
+      uninstall();
+
+      expect(remove).toHaveBeenCalledWith("navigate", expect.any(Function));
       remove.mockRestore();
       uninstall = installChunkReloadHandler(reload);
     });

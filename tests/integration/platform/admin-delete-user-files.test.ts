@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -125,5 +125,63 @@ describe("library delete removes cached previews (#1320, #1407)", () => {
     expect(res.statusCode, res.body).toBe(200);
     for (const path of previews) expect(existsSync(path), path).toBe(false);
     expect(existsSync(getStoredFilePath(file.storedName))).toBe(false);
+  });
+});
+
+/**
+ * Make one stored file undeletable without touching the rest of the folder:
+ * chmod on FILES_STORAGE_PATH would make every file in it undeletable, and
+ * the other tests in this file upload into it. A non-empty directory in the
+ * file's place makes unlink fail (EPERM on macOS, EISDIR on Linux) for this
+ * file alone.
+ */
+async function makeUndeletable(storedName: string): Promise<void> {
+  const path = getStoredFilePath(storedName);
+  await rm(path, { force: true });
+  await mkdir(path);
+  await writeFile(join(path, "keep"), "keep");
+}
+
+describe("a storage delete that fails stops the delete (#1455)", () => {
+  afterAll(async () => {
+    // Tidy the stand-in directories; nothing else in this file reads them.
+    for (const path of stuck) await rm(path, { recursive: true, force: true });
+  });
+  const stuck: string[] = [];
+
+  it("the library delete fails and keeps the row", async () => {
+    const { token } = await createUserAndLogin(testApp.app, "stuck-lib-1455");
+    const file = await uploadAs(token);
+    await makeUndeletable(file.storedName);
+    stuck.push(getStoredFilePath(file.storedName));
+
+    const res = await testApp.app.inject({
+      method: "DELETE",
+      url: "/api/v1/files",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { ids: [file.id] },
+    });
+    // 503 where the OS reports EPERM, 500 where it reports EISDIR. The 503
+    // message is pinned in file-storage.test.ts; this harness has no app error
+    // handler (#1243).
+    expect(res.statusCode, res.body).toBeGreaterThanOrEqual(500);
+    const rows = await db.select().from(schema.userFiles).where(eq(schema.userFiles.id, file.id));
+    expect(rows, "the row still points at the file, so a retry can finish").toHaveLength(1);
+  });
+
+  it("the admin user delete fails and keeps the user", async () => {
+    const { token, userId } = await createUserAndLogin(testApp.app, "stuck-admin-1455");
+    const file = await uploadAs(token);
+    await makeUndeletable(file.storedName);
+    stuck.push(getStoredFilePath(file.storedName));
+
+    const res = await testApp.app.inject({
+      method: "DELETE",
+      url: `/api/auth/users/${userId}`,
+      headers: { authorization: `Bearer ${adminToken}` },
+    });
+    expect(res.statusCode, res.body).toBeGreaterThanOrEqual(500);
+    const users = await db.select().from(schema.users).where(eq(schema.users.id, userId));
+    expect(users).toHaveLength(1);
   });
 });

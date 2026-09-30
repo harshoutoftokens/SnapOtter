@@ -262,6 +262,78 @@ describe("Users list includes OIDC fields", () => {
     expect(adminEntry.hasOidcLink).toBe(false);
   });
 
+  it("does not report a SAML user as OIDC-linked (issue #1606)", async () => {
+    // SAML keeps its NameID in external_id too, so a flag read off that
+    // column alone put the "OIDC" badge on every SAML user.
+    const userId = randomUUID();
+    const username = `saml_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    await db.insert(schema.users).values({
+      id: userId,
+      username,
+      // With a password too, the old flag showed the "Both" badge.
+      passwordHash: "not-a-real-hash",
+      role: "user",
+      team: "default-team-00000000",
+      mustChangePassword: false,
+      authProvider: "saml",
+      externalId: `nameid-${userId}`,
+    });
+    const sessionToken = randomUUID();
+    await db.insert(schema.sessions).values({
+      id: sessionToken,
+      userId,
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+
+    const session = await testApp.app.inject({
+      method: "GET",
+      url: "/api/auth/session",
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    expect(session.statusCode, session.body).toBe(200);
+    expect(JSON.parse(session.body).user.hasOidcLink).toBe(false);
+
+    const list = await testApp.app.inject({
+      method: "GET",
+      url: "/api/auth/users",
+      headers: { authorization: `Bearer ${adminToken}` },
+    });
+    expect(list.statusCode, list.body).toBe(200);
+    const entry = JSON.parse(list.body).users.find(
+      (u: { username: string }) => u.username === username,
+    );
+    expect(entry?.authProvider).toBe("saml");
+    expect(entry?.hasOidcLink).toBe(false);
+  });
+
+  it("does not report an OIDC user whose identity was detached as OIDC-linked", async () => {
+    // Migration 0008 and the 1.x import settle twin identities by clearing
+    // external_id and keeping auth_provider, so the provider alone isn't a link.
+    const userId = randomUUID();
+    const username = `detached_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    await db.insert(schema.users).values({
+      id: userId,
+      username,
+      role: "user",
+      team: "default-team-00000000",
+      mustChangePassword: false,
+      authProvider: "oidc",
+      externalId: null,
+    });
+
+    const list = await testApp.app.inject({
+      method: "GET",
+      url: "/api/auth/users",
+      headers: { authorization: `Bearer ${adminToken}` },
+    });
+    expect(list.statusCode, list.body).toBe(200);
+    const entry = JSON.parse(list.body).users.find(
+      (u: { username: string }) => u.username === username,
+    );
+    expect(entry?.authProvider).toBe("oidc");
+    expect(entry?.hasOidcLink).toBe(false);
+  });
+
   it("users list does not expose passwordHash or externalId directly", async () => {
     await createOidcUser();
 

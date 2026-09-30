@@ -6,9 +6,34 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import sharp from "sharp";
-import { asDecoderUnavailable, noDecoderFound } from "./format-decoders.js";
+import {
+  asDecoderUnavailable,
+  DecoderUnavailableError,
+  noDecoderFound,
+} from "./format-decoders.js";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * The server running out of memory mid-decode, which says nothing about the
+ * upload: V8 unable to allocate the buffer for the decoded PNG, or heif-dec
+ * killed with SIGKILL, the kernel OOM killer's signal (execFile's own timeout
+ * and abort send SIGTERM). It gets the same 503 ENGINE_UNAVAILABLE as a
+ * missing decoder, so every caller that already lets isDecoderUnavailable
+ * through answers it that way instead of a 422 blaming libheif (#1577). The
+ * message doesn't promise a retry will work: with no pixel limits passed, a
+ * very large image can exhaust memory every time.
+ */
+function asDecoderOutOfMemory(err: unknown): unknown {
+  const outOfMemory =
+    (err instanceof RangeError && err.message.startsWith("Array buffer allocation failed")) ||
+    (err as { signal?: unknown } | null)?.signal === "SIGKILL";
+  if (!outOfMemory) return err;
+  return new DecoderUnavailableError(
+    "The HEIF decoder ran out of memory decoding this image, or was killed. The image may need more memory than this server has.",
+    err,
+  );
+}
 
 export interface HeicDecodeOptions {
   maxDimension?: number;
@@ -161,16 +186,23 @@ export async function decodeHeic(buffer: Buffer, options: HeicDecodeOptions = {}
       timeout: 120_000,
       signal: options.signal,
     }).catch((err: unknown) => {
-      throw asDecoderUnavailable(err);
+      throw asDecoderUnavailable(asDecoderOutOfMemory(err));
     });
     options.signal?.throwIfAborted();
 
     // Single-image HEIF: exact filename. Multi-image: -1 suffix on first image.
+    // Only a missing file means "look for the suffixed one"; any other read
+    // failure (V8 unable to allocate the buffer, EIO) is the real error, and
+    // falling back would replace it with an ENOENT for a file that never
+    // existed (#1533).
     let decoded: Buffer;
     try {
       decoded = await readFile(outputPath);
-    } catch {
-      decoded = await readFile(suffixedPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw asDecoderOutOfMemory(err);
+      decoded = await readFile(suffixedPath).catch((suffixedErr: unknown) => {
+        throw asDecoderOutOfMemory(suffixedErr);
+      });
     }
     if (options.maxPixels !== undefined || options.maxDimension !== undefined) {
       try {

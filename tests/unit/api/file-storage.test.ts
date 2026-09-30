@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const config = vi.hoisted(() => ({
@@ -13,15 +13,44 @@ vi.mock("../../../apps/api/src/config.js", () => ({
   env: config,
 }));
 
-// Passthrough fs mock: only statfs is overridable, to simulate a full disk.
-const diskState = vi.hoisted(() => ({ lowDisk: false }));
+// Passthrough fs mock. statfs can report a full disk. Opening a file for
+// writing can fail outright (failOpenWith), or succeed and then have the write
+// through its handle stop halfway (the disk filling after the free-space check
+// passed), recording where it wrote. unlink can fail with EBUSY.
+const diskState = vi.hoisted(() => ({
+  lowDisk: false,
+  failOpenWith: "",
+  failWriteMidway: false,
+  failUnlink: false,
+  partialPath: "",
+}));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const errno = (code: string) => Object.assign(new Error(`${code}: simulated`), { code });
   return {
     ...actual,
     statfs: (path: string) =>
       diskState.lowDisk ? Promise.resolve({ bfree: 0, bsize: 4096 }) : actual.statfs(path),
+    open: async (...args: Parameters<typeof actual.open>) => {
+      const [path, flags] = args;
+      const forWriting = typeof flags === "string" && /[wax]/.test(flags);
+      if (forWriting && diskState.failOpenWith) throw errno(diskState.failOpenWith);
+      const handle = await actual.open(...args);
+      if (forWriting && diskState.failWriteMidway) {
+        const write = handle.writeFile.bind(handle);
+        Object.assign(handle, {
+          writeFile: async (data: Buffer) => {
+            diskState.partialPath = String(path);
+            await write(data.subarray(0, Math.floor(data.length / 2)));
+            throw errno("ENOSPC");
+          },
+        });
+      }
+      return handle;
+    },
+    unlink: (path: Parameters<typeof actual.unlink>[0]) =>
+      diskState.failUnlink ? Promise.reject(errno("EBUSY")) : actual.unlink(path),
   };
 });
 
@@ -36,6 +65,11 @@ beforeEach(async () => {
 
 afterEach(async () => {
   diskState.lowDisk = false;
+  diskState.failOpenWith = "";
+  diskState.failWriteMidway = false;
+  diskState.failUnlink = false;
+  diskState.partialPath = "";
+  vi.restoreAllMocks();
   await rm(testDir, { recursive: true, force: true });
 });
 
@@ -361,6 +395,8 @@ describe("storage not writable (EACCES)", () => {
   });
 
   it.skipIf(isRoot)("saveFile throws a SafeError when the directory is read-only", async () => {
+    const { logger } = await import("../../../apps/api/src/lib/logger.js");
+    const logError = vi.spyOn(logger, "error").mockImplementation(() => {});
     const { saveFile } = await importModule();
     try {
       await chmod(testDir, 0o555);
@@ -372,10 +408,77 @@ describe("storage not writable (EACCES)", () => {
       expect(err?.message).toBe("Storage directory is not writable");
       expect(err?.isSafeMessage).toBe(true);
       expect(err?.statusCode).toBe(503);
+      // Nothing was created, so there's no orphan to report (#1472).
+      expect(logError).not.toHaveBeenCalled();
     } finally {
       await chmod(testDir, 0o755).catch(() => {});
     }
   });
+
+  // #1472: with no search permission even the cleanup's unlink fails with
+  // EACCES, which used to log an orphan that was never created.
+  it.skipIf(isRoot)("saveFile logs no orphan when the directory can't be entered", async () => {
+    const { logger } = await import("../../../apps/api/src/lib/logger.js");
+    const logError = vi.spyOn(logger, "error").mockImplementation(() => {});
+    const { saveFile } = await importModule();
+    try {
+      await chmod(testDir, 0o000);
+      const err = (await saveFile(Buffer.from("x"), "a.png").then(
+        () => null,
+        (e: unknown) => e,
+      )) as StorageError | null;
+      expect(err?.message).toBe("Storage directory is not writable");
+      expect(err?.statusCode).toBe(503);
+      expect(logError).not.toHaveBeenCalled();
+    } finally {
+      await chmod(testDir, 0o755).catch(() => {});
+    }
+  });
+
+  // #1455: a delete that can't happen must not look like one that did.
+  it.skipIf(isRoot)(
+    "deleteStoredFile throws a SafeError when the file can't be removed",
+    async () => {
+      const { saveFile, deleteStoredFile } = await importModule();
+      const name = await saveFile(Buffer.from("keep"), "stuck.png");
+      try {
+        await chmod(testDir, 0o555);
+        const err = (await deleteStoredFile(name).then(
+          () => null,
+          (e: unknown) => e,
+        )) as StorageError | null;
+        expect(err).toBeInstanceOf(Error);
+        expect(err?.message).toBe("Storage directory is not writable");
+        expect(err?.isSafeMessage).toBe(true);
+        expect(err?.kind).toBe("operational");
+        expect(err?.code).toBe("EACCES");
+        expect(err?.statusCode).toBe(503);
+      } finally {
+        await chmod(testDir, 0o755).catch(() => {});
+      }
+      expect(existsSync(join(testDir, name)), "the file is still there").toBe(true);
+    },
+  );
+
+  it.skipIf(isRoot)(
+    "deleteThumbnail throws a SafeError when the thumbnail can't be removed",
+    async () => {
+      const { saveThumbnail, deleteThumbnail } = await importModule();
+      await saveThumbnail("stuck.png", Buffer.from("t"));
+      const thumbDir = join(testDir, ".thumbs");
+      try {
+        await chmod(thumbDir, 0o555);
+        const err = (await deleteThumbnail("stuck.png").then(
+          () => null,
+          (e: unknown) => e,
+        )) as StorageError | null;
+        expect(err?.message).toBe("Storage directory is not writable");
+        expect(err?.statusCode).toBe(503);
+      } finally {
+        await chmod(thumbDir, 0o755).catch(() => {});
+      }
+    },
+  );
 
   it.skipIf(isRoot)(
     "saveThumbnail throws a SafeError when the directory is read-only",
@@ -414,5 +517,75 @@ describe("disk space floor", () => {
     expect(err?.kind).toBe("operational");
     expect(err?.code).toBe("ENOSPC");
     expect(err?.statusCode).toBe(507);
+  });
+});
+
+// #1472: a write that fails partway leaves a partial file whose name never
+// reaches the caller, so only saveFile can remove it.
+describe("saveFile after a failed write", () => {
+  /** Files in the storage root, ignoring the thumbnail folder. */
+  async function storedFiles(): Promise<string[]> {
+    return (await readdir(testDir)).filter((name) => name !== ".thumbs");
+  }
+
+  it("removes the partly written file and rethrows the write error", async () => {
+    const { saveFile } = await importModule();
+    diskState.failWriteMidway = true;
+
+    const err = (await saveFile(Buffer.alloc(4096, 7), "photo.png").then(
+      () => null,
+      (e: unknown) => e,
+    )) as StorageError | null;
+
+    expect(err?.code).toBe("ENOSPC");
+    // The half-write really happened in the storage root, and is gone.
+    expect(dirname(diskState.partialPath)).toBe(testDir);
+    expect(existsSync(diskState.partialPath)).toBe(false);
+    expect(await storedFiles()).toEqual([]);
+  });
+
+  it("cleans up nothing, and logs nothing, when the file was never created", async () => {
+    const { logger } = await import("../../../apps/api/src/lib/logger.js");
+    const logError = vi.spyOn(logger, "error").mockImplementation(() => {});
+    const { saveFile } = await importModule();
+    // A read-only volume: creating fails, and so would any unlink.
+    diskState.failOpenWith = "EROFS";
+    diskState.failUnlink = true;
+
+    const err = (await saveFile(Buffer.alloc(16), "photo.png").then(
+      () => null,
+      (e: unknown) => e,
+    )) as StorageError | null;
+
+    expect(err?.code).toBe("EROFS");
+    expect(logError).not.toHaveBeenCalled();
+    expect(await storedFiles()).toEqual([]);
+  });
+
+  it("logs the file it couldn't remove, and still throws the write error", async () => {
+    const { logger } = await import("../../../apps/api/src/lib/logger.js");
+    const logError = vi.spyOn(logger, "error").mockImplementation(() => {});
+    const { saveFile } = await importModule();
+    diskState.failWriteMidway = true;
+    diskState.failUnlink = true;
+
+    const err = (await saveFile(Buffer.alloc(4096, 7), "photo.png").then(
+      () => null,
+      (e: unknown) => e,
+    )) as StorageError | null;
+
+    expect(err?.code).toBe("ENOSPC");
+    const [leftover, ...rest] = await storedFiles();
+    expect(rest).toEqual([]);
+    expect(diskState.partialPath).toBe(join(testDir, leftover));
+    expect((await readFile(join(testDir, leftover))).length).toBe(2048);
+    expect(logError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        storedName: leftover,
+        err: expect.objectContaining({ code: "EBUSY" }),
+        writeErr: expect.objectContaining({ code: "ENOSPC" }),
+      }),
+      expect.any(String),
+    );
   });
 });

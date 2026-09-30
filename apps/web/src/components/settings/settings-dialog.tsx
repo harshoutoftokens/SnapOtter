@@ -1,4 +1,14 @@
-import { APP_VERSION, CATEGORIES, SUPPORTED_LOCALES, TOOLS } from "@snapotter/shared";
+import {
+  APP_VERSION,
+  CATEGORIES,
+  isValidRoleName,
+  isValidUsername,
+  normalizeRoleName,
+  SUPPORTED_LOCALES,
+  TEAM_NAME_MAX_LENGTH,
+  TOOLS,
+  type TranslationKeys,
+} from "@snapotter/shared";
 import {
   BarChart3,
   Check,
@@ -32,10 +42,20 @@ import { useTranslation } from "@/contexts/i18n-context";
 import { useAuth } from "@/hooks/use-auth";
 import { useFocusTrap } from "@/hooks/use-focus-trap";
 import { useMobile } from "@/hooks/use-mobile";
-import { apiDelete, apiGet, apiPost, apiPut, clearToken, formatHeaders } from "@/lib/api";
+import {
+  ApiError,
+  apiDelete,
+  apiErrorMessage,
+  apiGet,
+  apiPost,
+  apiPut,
+  clearToken,
+  formatHeaders,
+} from "@/lib/api";
 import { appUrl } from "@/lib/app-url";
 import { shouldShowInstallFeedbackCard } from "@/lib/feedback";
 import { format, plural } from "@/lib/format";
+import { passwordErrorMessage } from "@/lib/password-errors";
 import { changedSettings, writableSettings } from "@/lib/settings-payload";
 import { getCategoryName, getToolDescription, getToolName } from "@/lib/tool-i18n";
 import { cn, copyToClipboard } from "@/lib/utils";
@@ -533,7 +553,7 @@ function GeneralSection() {
 
 /* ────────────────────── System ────────────────────── */
 
-function SystemSection() {
+export function SystemSection() {
   const { t } = useTranslation();
   const { role, hasPermission } = useAuth();
   const analyticsConfig = useAnalyticsStore((s) => s.config);
@@ -548,26 +568,23 @@ function SystemSection() {
   const [installFeedbackOpen, setInstallFeedbackOpen] = useState(false);
   const [bundleLoading, setBundleLoading] = useState(false);
   const [bundleError, setBundleError] = useState<string | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
 
-  useEffect(() => {
+  const loadSettings = useCallback(() => {
+    setLoading(true);
     apiGet<{ settings: Record<string, string> }>("/v1/settings")
       .then((data) => {
         setSettings(data.settings);
         originalSettingsRef.current = data.settings;
+        setLoadFailed(false);
       })
-      .catch(() => {
-        // Fallback defaults if endpoint not ready
-        const fallback = {
-          fileUploadLimitMb: "100",
-          defaultTheme: "system",
-          defaultLocale: "en",
-          loginAttemptLimit: "5",
-        };
-        setSettings(fallback);
-        originalSettingsRef.current = fallback;
-      })
+      .catch(() => setLoadFailed(true))
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    loadSettings();
+  }, [loadSettings]);
 
   const updateSetting = useCallback((key: string, value: string) => {
     setSettings((prev) => ({ ...prev, [key]: value }));
@@ -626,6 +643,12 @@ function SystemSection() {
         <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
       </div>
     );
+  }
+
+  // Invented defaults read as the live configuration: a 90-day audit
+  // retention would show as 0, "keep forever" (#1447).
+  if (loadFailed) {
+    return <LoadFailed message={t.settings.system.loadFailed} onRetry={loadSettings} />;
   }
 
   const installFeedbackVisible = shouldShowInstallFeedbackCard({
@@ -903,7 +926,7 @@ function SystemSection() {
 
 /* ────────────────────── Security ────────────────────── */
 
-function SecuritySection() {
+export function SecuritySection() {
   const { t } = useTranslation();
   const { hasPermission } = useAuth();
   const [currentPassword, setCurrentPassword] = useState("");
@@ -922,11 +945,6 @@ function SecuritySection() {
         setMessage({ type: "error", text: t.settings.security.passwordsMismatch });
         return;
       }
-      if (newPassword.length < 8) {
-        setMessage({ type: "error", text: t.settings.security.passwordTooShort });
-        return;
-      }
-
       setSubmitting(true);
       setMessage(null);
       try {
@@ -936,25 +954,19 @@ function SecuritySection() {
         setNewPassword("");
         setConfirmPassword("");
       } catch (err) {
-        const msg = err instanceof Error ? err.message : t.settings.security.changeFailed;
+        // The server knows the password policy (the length rule included), so
+        // its named rule answers here, in the user's language (#1445).
         setMessage({
           type: "error",
-          text: msg.includes("401") ? t.settings.security.currentPasswordIncorrect : msg,
+          text:
+            (err instanceof ApiError && passwordErrorMessage(t, err.status, err.body)) ||
+            t.settings.security.changeFailed,
         });
       } finally {
         setSubmitting(false);
       }
     },
-    [
-      currentPassword,
-      newPassword,
-      confirmPassword,
-      t.settings.security.changeFailed,
-      t.settings.security.currentPasswordIncorrect,
-      t.settings.security.changeSuccess,
-      t.settings.security.passwordsMismatch,
-      t.settings.security.passwordTooShort,
-    ],
+    [currentPassword, newPassword, confirmPassword, t],
   );
 
   return (
@@ -1080,6 +1092,22 @@ function SecuritySection() {
   );
 }
 
+/** What the Security tab calls each setting it saves, to name one the server refused. */
+function securitySettingLabel(t: TranslationKeys, key: string): string | undefined {
+  const labels: Partial<Record<string, string>> = {
+    sessionIdleTimeoutMinutes: t.settings.security.sessionIdleTimeout,
+    maxSessionsPerUser: t.settings.security.maxSessionsPerUser,
+    mfaPolicy: t.settings.security.mfaPolicy,
+    ssoEnforcement: t.settings.security.ssoEnforcement,
+    ssoBreakGlassUsername: t.settings.security.ssoBreakGlassUsername,
+    passwordMinLength: t.settings.security.passwordMinLength,
+    passwordRequireUppercase: t.settings.security.passwordRequireUppercase,
+    passwordRequireDigit: t.settings.security.passwordRequireNumber,
+    passwordRequireSpecial: t.settings.security.passwordRequireSpecial,
+  };
+  return labels[key];
+}
+
 export function AdminSecuritySettings() {
   const { t } = useTranslation();
   const [settings, setSettings] = useState<Record<string, string>>({});
@@ -1090,16 +1118,23 @@ export function AdminSecuritySettings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
 
-  useEffect(() => {
+  const loadSettings = useCallback(() => {
+    setLoading(true);
     apiGet<{ settings: Record<string, string> }>("/v1/settings")
       .then((data) => {
         setSettings(data.settings);
         originalSettingsRef.current = data.settings;
+        setLoadFailed(false);
       })
-      .catch(() => {})
+      .catch(() => setLoadFailed(true))
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    loadSettings();
+  }, [loadSettings]);
 
   const updateSetting = useCallback((key: string, value: string) => {
     setSettings((prev) => ({ ...prev, [key]: value }));
@@ -1116,9 +1151,26 @@ export function AdminSecuritySettings() {
       originalSettingsRef.current = { ...settings };
       setSaveMsg({ type: "success", text: t.settings.security.securitySettingsSaved });
     } catch (err) {
+      // A refused value comes back with the setting's key: name its row.
+      const refused =
+        err instanceof ApiError && typeof err.body.setting === "string"
+          ? securitySettingLabel(t, err.body.setting)
+          : undefined;
       setSaveMsg({
         type: "error",
-        text: err instanceof Error ? err.message : t.settings.security.securitySettingsFailed,
+        text: apiErrorMessage(
+          t,
+          err,
+          {
+            FEATURE_NOT_LICENSED: t.errors.featureNotLicensed,
+            ESCALATION_DENIED: t.errors.escalationDenied,
+            DEPENDENCY_VALIDATION_FAILED: t.settings.security.ssoNeedsProvider,
+            ...(refused && {
+              VALIDATION_ERROR: format(t.errors.invalidSetting, { setting: refused }),
+            }),
+          },
+          t.settings.security.securitySettingsFailed,
+        ),
       });
     } finally {
       setSaving(false);
@@ -1130,6 +1182,16 @@ export function AdminSecuritySettings() {
     return (
       <div className="flex items-center justify-center py-8">
         <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  // A form full of defaults would misstate the live policy (MFA off, no
+  // session limits), so a failed load shows only the failure (#1447).
+  if (loadFailed) {
+    return (
+      <div className="border-t border-border pt-6">
+        <LoadFailed message={t.settings.security.adminSettingsLoadFailed} onRetry={loadSettings} />
       </div>
     );
   }
@@ -1394,11 +1456,11 @@ function generatePassword(): string {
   return chars.join("");
 }
 
-function PeopleSection() {
+export function PeopleSection() {
   const { t } = useTranslation();
   const isMobile = useMobile();
   const [users, setUsers] = useState<UserEntry[]>([]);
-  const [maxUsers, setMaxUsers] = useState(5);
+  const [maxUsers, setMaxUsers] = useState(0);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [showAddForm, setShowAddForm] = useState(false);
@@ -1421,6 +1483,7 @@ function PeopleSection() {
   );
   const [teams, setTeams] = useState<TeamEntry[]>([]);
   const [availableRoles, setAvailableRoles] = useState<RoleEntry[]>([]);
+  const [loadFailed, setLoadFailed] = useState(false);
 
   const loadTeams = useCallback(async () => {
     try {
@@ -1436,20 +1499,37 @@ function PeopleSection() {
       const data = await apiGet<{ users: UserEntry[]; maxUsers: number }>("/auth/users");
       setUsers(data.users);
       setMaxUsers(data.maxUsers);
+      setLoadFailed(false);
     } catch {
       setUsers([]);
+      setLoadFailed(true);
     } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => {
+  // The team and role lists only feed the pickers, which fall back to Default
+  // and the built-in roles: those endpoints need teams:manage and audit:read,
+  // which a users:manage admin may not have, so their failure isn't the
+  // section's (#1447).
+  const loadRoles = useCallback(async () => {
+    try {
+      const data = await apiGet<{ roles: RoleEntry[] }>("/v1/roles");
+      setAvailableRoles(data.roles);
+    } catch {
+      setAvailableRoles([]);
+    }
+  }, []);
+
+  const loadAll = useCallback(() => {
     loadUsers();
     loadTeams();
-    apiGet<{ roles: RoleEntry[] }>("/v1/roles")
-      .then((data) => setAvailableRoles(data.roles))
-      .catch(() => setAvailableRoles([]));
-  }, [loadUsers, loadTeams]);
+    loadRoles();
+  }, [loadUsers, loadTeams, loadRoles]);
+
+  useEffect(() => {
+    loadAll();
+  }, [loadAll]);
 
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -1469,6 +1549,11 @@ function PeopleSection() {
     async (e: React.FormEvent) => {
       e.preventDefault();
       setAddError(null);
+      // The server's refusal names no rule, so check here and say which (#1445).
+      if (!isValidUsername(newUsername)) {
+        setAddError(t.settings.people.usernameInvalid);
+        return;
+      }
       setAdding(true);
       try {
         await apiPost("/auth/register", {
@@ -1487,26 +1572,25 @@ function PeopleSection() {
         setActionMsg({ type: "success", text: t.settings.people.createSuccess });
         await loadUsers();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : t.settings.people.createFailed;
         setAddError(
-          msg.includes("403") ? format(t.settings.people.userLimitReached, { max: maxUsers }) : msg,
+          (err instanceof ApiError && passwordErrorMessage(t, err.status, err.body)) ||
+            apiErrorMessage(
+              t,
+              err,
+              {
+                USER_LIMIT_REACHED: format(t.settings.people.userLimitReached, { max: maxUsers }),
+                CONFLICT: t.settings.people.usernameTaken,
+                ESCALATION_DENIED: t.errors.escalationDenied,
+              },
+              t.settings.people.createFailed,
+            ),
         );
       } finally {
         setAdding(false);
         setTimeout(() => setActionMsg(null), 3000);
       }
     },
-    [
-      newUsername,
-      newPassword,
-      newRole,
-      newTeam,
-      maxUsers,
-      loadUsers,
-      t.settings.people.createFailed,
-      t.settings.people.createSuccess,
-      t.settings.people.userLimitReached,
-    ],
+    [newUsername, newPassword, newRole, newTeam, maxUsers, loadUsers, t],
   );
 
   const handleDeleteUser = useCallback(
@@ -1519,18 +1603,24 @@ function PeopleSection() {
           text: format(t.settings.people.deleteSuccess, { username }),
         });
         await loadUsers();
-      } catch {
-        setActionMsg({ type: "error", text: t.settings.people.deleteFailed });
+      } catch (err) {
+        setActionMsg({
+          type: "error",
+          text: apiErrorMessage(
+            t,
+            err,
+            {
+              SELF_DELETE: t.settings.people.cannotDeleteSelf,
+              ESCALATION_DENIED: t.errors.escalationDenied,
+            },
+            t.settings.people.deleteFailed,
+          ),
+        });
       }
       setOpenMenuId(null);
       setTimeout(() => setActionMsg(null), 3000);
     },
-    [
-      loadUsers,
-      t.settings.people.deleteSuccess,
-      t.settings.people.deleteFailed,
-      t.settings.people.deleteConfirm,
-    ],
+    [loadUsers, t],
   );
 
   const handleUpdateUser = useCallback(
@@ -1546,22 +1636,23 @@ function PeopleSection() {
         setActionMsg({ type: "success", text: t.settings.people.updateSuccess });
         await loadUsers();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Failed to update user";
         setActionMsg({
           type: "error",
-          text: msg.includes("400") ? t.settings.people.cannotRemoveOwnAdmin : msg,
+          text: apiErrorMessage(
+            t,
+            err,
+            {
+              SELF_DEMOTE: t.settings.people.cannotRemoveOwnAdmin,
+              LAST_ADMIN: t.settings.people.lastAdmin,
+              ESCALATION_DENIED: t.errors.escalationDenied,
+            },
+            t.settings.people.updateFailed,
+          ),
         });
       }
       setTimeout(() => setActionMsg(null), 3000);
     },
-    [
-      editingUser,
-      editRole,
-      editTeam,
-      loadUsers,
-      t.settings.people.cannotRemoveOwnAdmin,
-      t.settings.people.updateSuccess,
-    ],
+    [editingUser, editRole, editTeam, loadUsers, t],
   );
 
   const handleResetPassword = useCallback(
@@ -1576,13 +1667,33 @@ function PeopleSection() {
         setResetPassword("");
         setActionMsg({ type: "success", text: t.settings.people.resetSuccess });
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Failed to reset password";
-        setActionMsg({ type: "error", text: msg });
+        setActionMsg({
+          type: "error",
+          text:
+            (err instanceof ApiError && passwordErrorMessage(t, err.status, err.body)) ||
+            apiErrorMessage(
+              t,
+              err,
+              { ESCALATION_DENIED: t.errors.escalationDenied },
+              t.settings.people.resetFailed,
+            ),
+        });
       }
       setTimeout(() => setActionMsg(null), 3000);
     },
-    [resetPasswordUser, resetPassword, t.settings.people.resetSuccess],
+    [resetPasswordUser, resetPassword, t],
   );
+
+  // A picker whose list fell back (built-in roles, Default) may not hold the
+  // user's current role or team, and a select whose value isn't an option
+  // shows the first one: the admin would read the wrong value, and "changing"
+  // to it would save nothing yet report success. Always offer the current one.
+  const editRoleListed =
+    availableRoles.length > 0
+      ? availableRoles.some((r) => r.name === editRole)
+      : ["user", "editor", "admin"].includes(editRole);
+  const editTeamListed =
+    teams.length > 0 ? teams.some((tm) => tm.name === editTeam) : editTeam === "Default";
 
   if (loading) {
     return (
@@ -1600,16 +1711,18 @@ function PeopleSection() {
         <p className="text-sm text-muted-foreground mt-1">{t.settings.people.description}</p>
       </div>
 
-      {/* User count */}
-      <p className="text-sm text-muted-foreground">
-        {maxUsers > 0
-          ? `${users.length} / ${maxUsers} ${plural(maxUsers, format(t.settings.people.userCount, { count: "" }), format(t.settings.people.userCountPlural, { count: "" })).trim()}`
-          : plural(
-              users.length,
-              format(t.settings.people.userCount, { count: users.length }),
-              format(t.settings.people.userCountPlural, { count: users.length }),
-            )}
-      </p>
+      {/* User count: none when the list didn't load, rather than a made-up 0 */}
+      {!loadFailed && (
+        <p className="text-sm text-muted-foreground">
+          {maxUsers > 0
+            ? `${users.length} / ${maxUsers} ${plural(maxUsers, format(t.settings.people.userCount, { count: "" }), format(t.settings.people.userCountPlural, { count: "" })).trim()}`
+            : plural(
+                users.length,
+                format(t.settings.people.userCount, { count: users.length }),
+                format(t.settings.people.userCountPlural, { count: users.length }),
+              )}
+        </p>
+      )}
 
       {/* Action message */}
       {actionMsg && (
@@ -1834,6 +1947,7 @@ function PeopleSection() {
               onChange={(e) => setEditRole(e.target.value)}
               className="px-3 py-2 rounded-lg border border-border bg-background text-sm text-foreground"
             >
+              {!editRoleListed && <option value={editRole}>{editRole}</option>}
               {availableRoles.length > 0 ? (
                 availableRoles.map((r) => (
                   <option key={r.name} value={r.name}>
@@ -1854,6 +1968,7 @@ function PeopleSection() {
               onChange={(e) => setEditTeam(e.target.value)}
               className="px-3 py-2 rounded-lg border border-border bg-background text-sm text-foreground w-40"
             >
+              {!editTeamListed && <option value={editTeam}>{editTeam}</option>}
               {teams.map((tm) => (
                 <option key={tm.id} value={tm.name}>
                   {tm.name}
@@ -1934,7 +2049,15 @@ function PeopleSection() {
         )}
 
         {/* Table rows */}
-        {filteredUsers.length === 0 ? (
+        {loadFailed ? (
+          <LoadFailed
+            message={t.settings.people.loadFailed}
+            onRetry={() => {
+              setLoading(true);
+              loadAll();
+            }}
+          />
+        ) : filteredUsers.length === 0 ? (
           <div className="px-4 py-8 text-center text-sm text-muted-foreground rounded-b-lg">
             {search ? t.settings.people.noSearchResults : t.settings.people.noUsersFound}
           </div>
@@ -2107,14 +2230,17 @@ export function ApiKeysSection() {
   const [scopedPerms, setScopedPerms] = useState<string[]>([]);
   const [expiresAt, setExpiresAt] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
   const { permissions } = useAuth();
 
   const loadKeys = useCallback(async () => {
     try {
       const data = await apiGet<{ apiKeys: ApiKeyEntry[] }>("/v1/api-keys");
       setKeys(data.apiKeys);
+      setLoadFailed(false);
     } catch {
       setKeys([]);
+      setLoadFailed(true);
     } finally {
       setLoading(false);
     }
@@ -2347,8 +2473,17 @@ export function ApiKeysSection() {
         </div>
       )}
 
-      {keys.length === 0 && !newKey && (
-        <p className="text-sm text-muted-foreground">{t.settings.apiKeys.emptyState}</p>
+      {loadFailed ? (
+        <LoadFailed
+          message={t.settings.apiKeys.loadFailed}
+          onRetry={() => {
+            setLoading(true);
+            loadKeys();
+          }}
+        />
+      ) : (
+        keys.length === 0 &&
+        !newKey && <p className="text-sm text-muted-foreground">{t.settings.apiKeys.emptyState}</p>
       )}
     </div>
   );
@@ -2356,7 +2491,7 @@ export function ApiKeysSection() {
 
 /* ────────────────────── Teams ────────────────────── */
 
-function TeamsSection() {
+export function TeamsSection() {
   const { t } = useTranslation();
   const isMobile = useMobile();
   const [teams, setTeams] = useState<TeamEntry[]>([]);
@@ -2374,13 +2509,16 @@ function TeamsSection() {
   const [actionMsg, setActionMsg] = useState<{ type: "success" | "error"; text: string } | null>(
     null,
   );
+  const [loadFailed, setLoadFailed] = useState(false);
 
   const loadTeams = useCallback(async () => {
     try {
       const data = await apiGet<{ teams: TeamEntry[] }>("/v1/teams");
       setTeams(data.teams);
+      setLoadFailed(false);
     } catch {
       setTeams([]);
+      setLoadFailed(true);
     } finally {
       setLoading(false);
     }
@@ -2410,17 +2548,25 @@ function TeamsSection() {
         setActionMsg({ type: "success", text: t.settings.teams.createSuccess });
         await loadTeams();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Failed to create team";
         setActionMsg({
           type: "error",
-          text: msg.includes("409") ? t.settings.teams.duplicateName : msg,
+          text: apiErrorMessage(
+            t,
+            err,
+            {
+              CONFLICT: t.settings.teams.duplicateName,
+              // Blank names never leave the form, so length is the only rule left.
+              VALIDATION_ERROR: t.settings.teams.nameTooLong,
+            },
+            t.settings.teams.createFailed,
+          ),
         });
       } finally {
         setCreating(false);
         setTimeout(() => setActionMsg(null), 3000);
       }
     },
-    [newTeamName, loadTeams, t.settings.teams.duplicateName, t.settings.teams.createSuccess],
+    [newTeamName, loadTeams, t],
   );
 
   const handleRename = useCallback(
@@ -2433,12 +2579,22 @@ function TeamsSection() {
         setActionMsg({ type: "success", text: t.settings.teams.renameSuccess });
         await loadTeams();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Failed to rename team";
-        setActionMsg({ type: "error", text: msg });
+        setActionMsg({
+          type: "error",
+          text: apiErrorMessage(
+            t,
+            err,
+            {
+              CONFLICT: t.settings.teams.duplicateName,
+              VALIDATION_ERROR: t.settings.teams.nameTooLong,
+            },
+            t.settings.teams.renameFailed,
+          ),
+        });
       }
       setTimeout(() => setActionMsg(null), 3000);
     },
-    [editingTeamName, loadTeams, t.settings.teams.renameSuccess],
+    [editingTeamName, loadTeams, t],
   );
 
   const handleDelete = useCallback(
@@ -2446,19 +2602,25 @@ function TeamsSection() {
       if (!confirm(format(t.settings.teams.deleteConfirm, { name }))) return;
       try {
         await apiDelete(`/v1/teams/${id}`);
-        setActionMsg({ type: "success", text: `Team "${name}" deleted` });
+        setActionMsg({ type: "success", text: format(t.settings.teams.deleteSuccess, { name }) });
         await loadTeams();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Failed to delete team";
+        // Both refusals (the Default team, a team with members) are 400s with
+        // VALIDATION_ERROR, and this one line covers both.
         setActionMsg({
           type: "error",
-          text: msg.includes("400") ? t.settings.teams.cannotDeleteDefault : msg,
+          text: apiErrorMessage(
+            t,
+            err,
+            { VALIDATION_ERROR: t.settings.teams.cannotDeleteDefault },
+            t.settings.teams.deleteFailed,
+          ),
         });
       }
       setOpenMenuId(null);
       setTimeout(() => setActionMsg(null), 3000);
     },
-    [loadTeams, t.settings.teams.deleteConfirm, t.settings.teams.cannotDeleteDefault],
+    [loadTeams, t],
   );
 
   const handleExpandTeam = useCallback(
@@ -2488,14 +2650,16 @@ function TeamsSection() {
         setExpandedTeamId(null);
         await loadTeams();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Failed to save";
-        setActionMsg({ type: "error", text: msg });
+        setActionMsg({
+          type: "error",
+          text: apiErrorMessage(t, err, {}, t.settings.teams.quotaSaveFailed),
+        });
       } finally {
         setSavingQuota(false);
         setTimeout(() => setActionMsg(null), 3000);
       }
     },
-    [quotaMb, retention, loadTeams, t.settings.teams.quotaSaved],
+    [quotaMb, retention, loadTeams, t],
   );
 
   if (loading) {
@@ -2550,6 +2714,7 @@ function TeamsSection() {
               onChange={(e) => setNewTeamName(e.target.value)}
               placeholder={t.settings.teams.teamNamePlaceholder}
               required
+              maxLength={TEAM_NAME_MAX_LENGTH}
               className="px-3 py-2 rounded-lg border border-border bg-background text-sm text-foreground flex-1"
             />
             <button
@@ -2581,7 +2746,15 @@ function TeamsSection() {
           </div>
         )}
 
-        {teams.length === 0 ? (
+        {loadFailed ? (
+          <LoadFailed
+            message={t.settings.teams.loadFailed}
+            onRetry={() => {
+              setLoading(true);
+              loadTeams();
+            }}
+          />
+        ) : teams.length === 0 ? (
           <div className="px-4 py-8 text-center text-sm text-muted-foreground rounded-b-lg">
             {t.settings.teams.emptyState}
           </div>
@@ -2601,6 +2774,7 @@ function TeamsSection() {
                         type="text"
                         value={editingTeamName}
                         onChange={(e) => setEditingTeamName(e.target.value)}
+                        maxLength={TEAM_NAME_MAX_LENGTH}
                         className="px-2 py-1 rounded border border-border bg-background text-sm text-foreground w-40"
                         ref={(el) => el?.focus()}
                         onKeyDown={(e) => {
@@ -2663,6 +2837,8 @@ function TeamsSection() {
                       setOpenMenuId(openMenuId === tm.id ? null : tm.id);
                     }}
                     className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                    title={t.common.actions}
+                    aria-label={t.common.actions}
                   >
                     <MoreVertical className="h-4 w-4" />
                   </button>
@@ -2784,24 +2960,24 @@ function TeamsSection() {
 /* ────────────────────── Roles ────────────────────── */
 
 const PERMISSION_GROUPS = [
-  { label: "Tools", permissions: ["tools:use"] },
-  { label: "Files", permissions: ["files:own", "files:all"] },
-  { label: "API Keys", permissions: ["apikeys:own", "apikeys:all"] },
-  { label: "Pipelines", permissions: ["pipelines:own", "pipelines:all"] },
-  { label: "Settings", permissions: ["settings:read", "settings:write"] },
-  { label: "Users", permissions: ["users:manage"] },
-  { label: "Teams", permissions: ["teams:manage"] },
+  { id: "tools", permissions: ["tools:use"] },
+  { id: "files", permissions: ["files:own", "files:all"] },
+  { id: "apiKeys", permissions: ["apikeys:own", "apikeys:all"] },
+  { id: "pipelines", permissions: ["pipelines:own", "pipelines:all"] },
+  { id: "settings", permissions: ["settings:read", "settings:write"] },
+  { id: "users", permissions: ["users:manage"] },
+  { id: "teams", permissions: ["teams:manage"] },
   {
-    label: "System",
+    id: "system",
     permissions: ["features:manage", "system:health", "audit:read"],
   },
   {
-    label: "Enterprise Administration",
+    id: "enterpriseAdmin",
     permissions: ["security:manage", "compliance:manage", "webhooks:manage"],
   },
-];
+] as const;
 
-function RolesSection() {
+export function RolesSection() {
   const { t } = useTranslation();
   const [roles, setRoles] = useState<RoleEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -2817,12 +2993,16 @@ function RolesSection() {
     null,
   );
 
+  const [loadFailed, setLoadFailed] = useState(false);
+
   const loadRoles = useCallback(async () => {
     try {
       const data = await apiGet<{ roles: RoleEntry[] }>("/v1/roles");
       setRoles(data.roles);
+      setLoadFailed(false);
     } catch {
       setRoles([]);
+      setLoadFailed(true);
     } finally {
       setLoading(false);
     }
@@ -2836,9 +3016,20 @@ function RolesSection() {
     async (e: React.FormEvent) => {
       e.preventDefault();
       if (!newName.trim()) return;
+      // The server's refusals for these name no rule, so check here (#1445).
+      const invalid = !isValidRoleName(newName)
+        ? t.settings.roles.nameInvalid
+        : newPermissions.length === 0
+          ? t.settings.roles.permissionsRequired
+          : null;
+      if (invalid) {
+        setActionMsg({ type: "error", text: invalid });
+        setTimeout(() => setActionMsg(null), 3000);
+        return;
+      }
       try {
         await apiPost("/v1/roles", {
-          name: newName.trim().toLowerCase(),
+          name: normalizeRoleName(newName),
           description: newDescription.trim(),
           permissions: newPermissions,
         });
@@ -2849,31 +3040,36 @@ function RolesSection() {
         setActionMsg({ type: "success", text: t.settings.roles.createSuccess });
         await loadRoles();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Failed to create role";
         setActionMsg({
           type: "error",
-          text: msg.includes("409") ? t.settings.roles.duplicateRoleError : msg,
+          text: apiErrorMessage(
+            t,
+            err,
+            {
+              CONFLICT: t.settings.roles.duplicateRoleError,
+              ESCALATION_DENIED: t.errors.escalationDenied,
+            },
+            t.settings.roles.createFailed,
+          ),
         });
       }
       setTimeout(() => setActionMsg(null), 3000);
     },
-    [
-      newName,
-      newDescription,
-      newPermissions,
-      loadRoles,
-      t.settings.roles.duplicateRoleError,
-      t.settings.roles.createSuccess,
-    ],
+    [newName, newDescription, newPermissions, loadRoles, t],
   );
 
   const handleUpdate = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
       if (!editingRole) return;
+      if (!isValidRoleName(editName)) {
+        setActionMsg({ type: "error", text: t.settings.roles.nameInvalid });
+        setTimeout(() => setActionMsg(null), 3000);
+        return;
+      }
       try {
         await apiPut(`/v1/roles/${editingRole.id}`, {
-          name: editName.trim().toLowerCase(),
+          name: normalizeRoleName(editName),
           description: editDescription.trim(),
           permissions: editPermissions,
         });
@@ -2881,39 +3077,52 @@ function RolesSection() {
         setActionMsg({ type: "success", text: t.settings.roles.updateSuccess });
         await loadRoles();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Failed to update role";
-        setActionMsg({ type: "error", text: msg });
+        setActionMsg({
+          type: "error",
+          text: apiErrorMessage(
+            t,
+            err,
+            {
+              CONFLICT: t.settings.roles.duplicateRoleError,
+              ESCALATION_DENIED: t.errors.escalationDenied,
+            },
+            t.settings.roles.updateFailed,
+          ),
+        });
       }
       setTimeout(() => setActionMsg(null), 3000);
     },
-    [
-      editingRole,
-      editName,
-      editDescription,
-      editPermissions,
-      loadRoles,
-      t.settings.roles.updateSuccess,
-    ],
+    [editingRole, editName, editDescription, editPermissions, loadRoles, t],
   );
 
   const handleDelete = useCallback(
     async (role: RoleEntry) => {
-      const msg =
+      const question =
         role.userCount > 0
-          ? `Delete role "${role.name}"? ${role.userCount} user${role.userCount !== 1 ? "s" : ""} will need to be reassigned.`
-          : `Delete role "${role.name}"?`;
-      if (!confirm(msg)) return;
+          ? format(t.settings.roles.deleteConfirm, { name: role.name, count: role.userCount })
+          : format(t.settings.roles.deleteConfirmSimple, { name: role.name });
+      if (!confirm(question)) return;
       try {
         await apiDelete(`/v1/roles/${role.id}`);
-        setActionMsg({ type: "success", text: `Role "${role.name}" deleted` });
+        setActionMsg({
+          type: "success",
+          text: format(t.settings.roles.deleteSuccess, { name: role.name }),
+        });
         await loadRoles();
       } catch (err) {
-        const errMsg = err instanceof Error ? err.message : "Failed to delete role";
-        setActionMsg({ type: "error", text: errMsg });
+        setActionMsg({
+          type: "error",
+          text: apiErrorMessage(
+            t,
+            err,
+            { ESCALATION_DENIED: t.errors.escalationDenied },
+            t.settings.roles.deleteFailed,
+          ),
+        });
       }
       setTimeout(() => setActionMsg(null), 3000);
     },
-    [loadRoles],
+    [loadRoles, t],
   );
 
   const togglePermission = (perm: string, list: string[], setter: (v: string[]) => void) => {
@@ -2980,6 +3189,7 @@ function RolesSection() {
               value={newDescription}
               onChange={(e) => setNewDescription(e.target.value)}
               placeholder={t.settings.roles.descriptionPlaceholder}
+              maxLength={500}
               className="px-3 py-2 rounded-lg border border-border bg-background text-sm text-foreground"
             />
           </div>
@@ -2989,8 +3199,10 @@ function RolesSection() {
             </p>
             <div className="grid grid-cols-2 gap-3">
               {PERMISSION_GROUPS.map((group) => (
-                <div key={group.label} className="space-y-1">
-                  <p className="text-xs font-semibold text-foreground">{group.label}</p>
+                <div key={group.id} className="space-y-1">
+                  <p className="text-xs font-semibold text-foreground">
+                    {t.settings.roles.permGroup[group.id]}
+                  </p>
                   {group.permissions.map((perm) => (
                     <label key={perm} className="flex items-center gap-1.5 text-xs cursor-pointer">
                       <input
@@ -3052,6 +3264,7 @@ function RolesSection() {
               value={editDescription}
               onChange={(e) => setEditDescription(e.target.value)}
               placeholder={t.settings.roles.descriptionPlaceholder}
+              maxLength={500}
               className="px-3 py-2 rounded-lg border border-border bg-background text-sm text-foreground"
             />
           </div>
@@ -3061,8 +3274,10 @@ function RolesSection() {
             </p>
             <div className="grid grid-cols-2 gap-3">
               {PERMISSION_GROUPS.map((group) => (
-                <div key={group.label} className="space-y-1">
-                  <p className="text-xs font-semibold text-foreground">{group.label}</p>
+                <div key={group.id} className="space-y-1">
+                  <p className="text-xs font-semibold text-foreground">
+                    {t.settings.roles.permGroup[group.id]}
+                  </p>
                   {group.permissions.map((perm) => (
                     <label key={perm} className="flex items-center gap-1.5 text-xs cursor-pointer">
                       <input
@@ -3098,7 +3313,15 @@ function RolesSection() {
 
       {/* Role cards */}
       <div className="space-y-3">
-        {roles.length === 0 ? (
+        {loadFailed ? (
+          <LoadFailed
+            message={t.settings.roles.loadFailed}
+            onRetry={() => {
+              setLoading(true);
+              loadRoles();
+            }}
+          />
+        ) : roles.length === 0 ? (
           <p className="text-sm text-muted-foreground text-center py-8">
             {t.settings.roles.emptyState}
           </p>
@@ -3232,7 +3455,7 @@ function formatRelativeTime(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
-function AuditLogSection() {
+export function AuditLogSection() {
   const { t } = useTranslation();
   const isMobile = useMobile();
   const [entries, setEntries] = useState<AuditEntry[]>([]);
@@ -3241,6 +3464,7 @@ function AuditLogSection() {
   const [loading, setLoading] = useState(true);
   const [actionFilter, setActionFilter] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
   const limit = 25;
 
   const fetchEntries = useCallback(async () => {
@@ -3253,9 +3477,11 @@ function AuditLogSection() {
       );
       setEntries(data.entries);
       setTotal(data.total);
+      setLoadFailed(false);
     } catch {
       setEntries([]);
       setTotal(0);
+      setLoadFailed(true);
     } finally {
       setLoading(false);
     }
@@ -3294,6 +3520,8 @@ function AuditLogSection() {
         <div className="flex items-center justify-center py-12">
           <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
         </div>
+      ) : loadFailed ? (
+        <LoadFailed message={t.settings.auditLog.loadFailed} onRetry={fetchEntries} />
       ) : entries.length === 0 ? (
         <p className="text-sm text-muted-foreground text-center py-8">
           {t.settings.auditLog.emptyState}
@@ -3682,6 +3910,27 @@ function AboutSection() {
 }
 
 /* ────────────────────── Shared ────────────────────── */
+
+/**
+ * Stands in for a list or form whose data failed to load, so an empty list
+ * only ever means "there are none" (#1447): "No API keys" after a 500 reads
+ * as a fact, and an admin may go and create them again.
+ */
+function LoadFailed({ message, onRetry }: { message: string; onRetry: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <div role="alert" className="px-4 py-8 text-center space-y-3">
+      <p className="text-sm text-destructive">{message}</p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="px-3 py-1.5 rounded-lg border border-border text-sm text-foreground hover:bg-muted transition-colors"
+      >
+        {t.common.retry}
+      </button>
+    </div>
+  );
+}
 
 function SettingRow({
   label,

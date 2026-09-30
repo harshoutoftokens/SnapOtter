@@ -5,13 +5,13 @@
  * copies library file contents, and produces a ZIP archive stored in
  * object storage under `outputs/<jobId>/gdpr-export.zip`.
  */
-import { PassThrough } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import archiver from "archiver";
 import { eq } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { readStoredFile } from "../lib/file-storage.js";
-import { putObject } from "../lib/object-storage.js";
+import { putObjectStream } from "../lib/object-storage.js";
 
 export async function gdprExportJob(userId: string, jobId: string): Promise<{ outputRef: string }> {
   // 1. Fetch user profile.
@@ -31,6 +31,7 @@ export async function gdprExportJob(userId: string, jobId: string): Promise<{ ou
       email: schema.users.email,
       authProvider: schema.users.authProvider,
       externalId: schema.users.externalId,
+      scimExternalId: schema.users.scimExternalId,
       mustChangePassword: schema.users.mustChangePassword,
       legalHold: schema.users.legalHold,
       storageUsed: schema.users.storageUsed,
@@ -119,10 +120,13 @@ export async function gdprExportJob(userId: string, jobId: string): Promise<{ ou
   await archive.finalize();
   await pipelineDone;
 
-  // 7. Write ZIP to object storage
+  // 7. Write ZIP to object storage. Staged and renamed (putObjectStream), not a
+  // direct write: stranded-job reconciliation adopts whatever archive sits in
+  // outputs/<jobId>/ as the finished export, so a write that dies partway must
+  // leave nothing there (#1441).
   const zipBuffer = Buffer.concat(chunks);
   const outputRef = `outputs/${jobId}/gdpr-export.zip`;
-  await putObject(outputRef, zipBuffer);
+  await putObjectStream(outputRef, Readable.from([zipBuffer]));
 
   return { outputRef };
 }

@@ -7,7 +7,12 @@ import { captureHandledError } from "@/lib/analytics";
 import { formatHeaders } from "@/lib/api";
 import { appUrl, resolveServerUrls } from "@/lib/app-url";
 import { format } from "@/lib/format";
-import { FRAME_HANDLING_FAILED, type ProgressFrame } from "@/lib/progress-frames";
+import {
+  frameFailure,
+  type JobFailure,
+  jobFailureMessage,
+  type ProgressFrame,
+} from "@/lib/progress-frames";
 import {
   addSignature,
   deleteSignature,
@@ -25,7 +30,7 @@ const SSE_STALL_TIMEOUT_MS = 5 * 60_000;
 interface ProgressHandlers {
   onProgress?: (percent: number) => void;
   onComplete: (result: Record<string, unknown>) => void;
-  onFailed: (error: string) => void;
+  onFailed: (failure: JobFailure) => void;
   onStall: () => void;
 }
 
@@ -102,7 +107,7 @@ export function subscribeSignPdfJobProgress(
         }
         if (data.phase === "failed") {
           cleanup();
-          handlers.onFailed(typeof data.error === "string" ? data.error : "Processing failed");
+          handlers.onFailed(frameFailure(data.error, data.details));
           return;
         }
         if (typeof data.percent === "number") handlers.onProgress?.(data.percent);
@@ -111,7 +116,7 @@ export function subscribeSignPdfJobProgress(
         // with it, so nothing else would ever settle the run.
         cleanup();
         try {
-          handlers.onFailed(FRAME_HANDLING_FAILED);
+          handlers.onFailed({ reason: "trackingFailed" });
         } catch {
           // onFailed may be what threw; the original error is rethrown below.
         }
@@ -253,7 +258,7 @@ export function SignPdfSettings({ signProps }: { signProps?: SignProps }) {
       return null;
     });
     if (!exported) {
-      setError("Could not read the placed signatures. Try again.");
+      setError(sp.exportFailed);
       endRun();
       return;
     }
@@ -276,7 +281,7 @@ export function SignPdfSettings({ signProps }: { signProps?: SignProps }) {
       if (landed) return;
       const url = typeof r.downloadUrl === "string" ? r.downloadUrl : null;
       if (!url) {
-        setError("Invalid response");
+        setError(t.errors.invalidResponse);
         return;
       }
       landed = true;
@@ -301,14 +306,12 @@ export function SignPdfSettings({ signProps }: { signProps?: SignProps }) {
         landResult(r);
         finish();
       },
-      onFailed: (err) => {
-        setError(err);
+      onFailed: (failure) => {
+        setError(jobFailureMessage(failure, t.errors));
         finish();
       },
       onStall: () => {
-        setError(
-          "Processing timed out. The result may have saved to your files; otherwise, try again.",
-        );
+        setError(sp.stall);
         finish();
       },
     });
@@ -343,7 +346,7 @@ export function SignPdfSettings({ signProps }: { signProps?: SignProps }) {
         try {
           landResult(resolveServerUrls(JSON.parse(xhr.responseText)));
         } catch {
-          setError("Invalid response");
+          setError(t.errors.invalidResponse);
         }
       } else {
         try {
@@ -353,10 +356,10 @@ export function SignPdfSettings({ signProps }: { signProps?: SignProps }) {
               ? b.error
               : typeof b.details === "string"
                 ? b.details
-                : `Failed: ${xhr.status}`,
+                : format(t.errors.failedWithStatus, { status: xhr.status }),
           );
         } catch {
-          setError(`Processing failed: ${xhr.status}`);
+          setError(format(t.errors.processingFailedWithStatus, { status: xhr.status }));
         }
       }
       endRun();
@@ -364,13 +367,13 @@ export function SignPdfSettings({ signProps }: { signProps?: SignProps }) {
     xhr.onerror = () => {
       stopProgress();
       progressCleanupRef.current = null;
-      setError("Network error");
+      setError(t.errors.network);
       endRun();
     };
     xhr.ontimeout = () => {
       stopProgress();
       progressCleanupRef.current = null;
-      setError("Request timed out. Try again.");
+      setError(sp.timeout);
       endRun();
     };
     xhr.open("POST", appUrl("/api/v1/tools/pdf/sign-pdf"));

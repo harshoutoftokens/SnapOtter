@@ -1,12 +1,20 @@
+import { isToolInputError } from "@snapotter/shared";
 import type { FastifyInstance } from "fastify";
 import sharp from "sharp";
 import { z } from "zod";
 import { autoOrient } from "../../lib/auto-orient.js";
+import { reportError, safeFormatTag } from "../../lib/error-report.js";
 import { formatZodErrors } from "../../lib/errors.js";
 import { validateImageBuffer } from "../../lib/file-validation.js";
 import { sanitizeFilename } from "../../lib/filename.js";
-import { decodeToSharpCompat, needsCliDecode } from "../../lib/format-decoders.js";
+import {
+  decodeToSharpCompat,
+  isDecoderUnavailable,
+  needsCliDecode,
+} from "../../lib/format-decoders.js";
 import { decodeHeic } from "../../lib/heic-converter.js";
+import { asInputErrorIfUndecodable } from "../../lib/image-error.js";
+import { logger } from "../../lib/logger.js";
 import { multipartFailure } from "../../lib/multipart-parts.js";
 import { decompressSvgz, sanitizeSvg } from "../../lib/svg-sanitize.js";
 
@@ -80,8 +88,14 @@ async function extractFileInfo(file: FileData): Promise<FileInfo> {
       .jpeg({ quality: 70 })
       .toBuffer();
     thumbnail = `data:image/jpeg;base64,${thumbBuffer.toString("base64")}`;
-  } catch {
-    // Non-fatal: some formats may fail thumbnail generation
+  } catch (err) {
+    // Non-fatal: the UI shows the entry without a preview. Info rather than
+    // debug, since it fires once per file and only on failure, and the default
+    // LOG_LEVEL would hide a debug line.
+    logger.info(
+      { err, filename: file.filename, format },
+      "find-duplicates: thumbnail failed, returning null",
+    );
   }
 
   return {
@@ -164,7 +178,14 @@ export function registerFindDuplicates(app: FastifyInstance) {
         if (validation.format === "heif") {
           try {
             file.buffer = await decodeHeic(file.buffer);
-          } catch {
+          } catch (err) {
+            // A missing decoder is the operator's problem, not this file's:
+            // the outer catch rethrows it so the request answers 503.
+            if (isDecoderUnavailable(err)) throw err;
+            logger.warn(
+              { err, filename: file.filename, format: validation.format },
+              "find-duplicates: skipping file, HEIC decode failed",
+            );
             skippedFiles.push({ filename: file.filename, reason: "Failed to decode HEIC" });
             continue;
           }
@@ -173,10 +194,24 @@ export function registerFindDuplicates(app: FastifyInstance) {
           try {
             const fileExt = file.filename.split(".").pop()?.toLowerCase();
             file.buffer = await decodeToSharpCompat(file.buffer, validation.format, fileExt);
-          } catch {
+          } catch (decodeErr) {
+            // Sharp reads some of these formats itself (DNG is a TIFF), so the
+            // decoder's failure only matters once that fallback fails too.
             try {
               await sharp(file.buffer).metadata();
-            } catch {
+            } catch (err) {
+              if (isDecoderUnavailable(decodeErr)) throw decodeErr;
+              // pino serializes only the `err` key as an Error, so the decoder's
+              // failure goes in as its message or it would land as `{}`.
+              logger.warn(
+                {
+                  err,
+                  decodeErr: decodeErr instanceof Error ? decodeErr.message : String(decodeErr),
+                  filename: file.filename,
+                  format: validation.format,
+                },
+                "find-duplicates: skipping file, decode failed",
+              );
               skippedFiles.push({
                 filename: file.filename,
                 reason: `Failed to decode ${validation.format.toUpperCase()}`,
@@ -189,7 +224,11 @@ export function registerFindDuplicates(app: FastifyInstance) {
           try {
             file.buffer = decompressSvgz(file.buffer);
             file.buffer = sanitizeSvg(file.buffer);
-          } catch {
+          } catch (err) {
+            logger.warn(
+              { err, filename: file.filename, format: validation.format },
+              "find-duplicates: skipping file, SVG sanitize failed",
+            );
             skippedFiles.push({ filename: file.filename, reason: "Invalid SVG" });
             continue;
           }
@@ -218,8 +257,31 @@ export function registerFindDuplicates(app: FastifyInstance) {
           const info = await extractFileInfo(file);
           info.hash = await computeDHash128(file.buffer);
           fileInfos.push(info);
-        } catch {
-          skippedFiles.push({ filename: file.filename, reason: "Failed to compute image hash" });
+        } catch (err) {
+          // This is where a buffer Sharp can't decode gets rejected. The probe
+          // in asInputErrorIfUndecodable tells a corrupt upload (expected: the
+          // user is told, info line, no Sentry) from a hash failure on an image
+          // Sharp can decode (a real fault: error line and a report). It logs
+          // the probe result itself; the line here adds the filename.
+          const classified = await asInputErrorIfUndecodable(file.buffer, err);
+          if (isToolInputError(classified)) {
+            logger.info(
+              { err, filename: file.filename, reason: classified.message },
+              "find-duplicates: skipping undecodable file",
+            );
+            skippedFiles.push({ filename: file.filename, reason: classified.message });
+          } else {
+            logger.error(
+              { err, filename: file.filename },
+              "find-duplicates: hash failed on a decodable image",
+            );
+            void reportError(err, {
+              source: "http",
+              toolId: "find-duplicates",
+              inputFormat: safeFormatTag(file.filename),
+            });
+            skippedFiles.push({ filename: file.filename, reason: "Failed to compute image hash" });
+          }
         }
       }
 
@@ -326,6 +388,9 @@ export function registerFindDuplicates(app: FastifyInstance) {
         skippedFiles: skippedFiles.length > 0 ? skippedFiles : undefined,
       });
     } catch (err) {
+      // Let the global handler answer a missing decoder as 503 and report it,
+      // the way the other custom routes do (#795, #1428).
+      if (isDecoderUnavailable(err)) throw err;
       return reply.status(422).send({
         error: "Duplicate detection failed",
         details: err instanceof Error ? err.message : "Unknown error",
