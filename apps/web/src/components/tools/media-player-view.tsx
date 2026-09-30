@@ -23,16 +23,17 @@ export function MediaPlayerView() {
   // videoWidth will be 0. Fall back to the server-transcode preview.
   if (!isAudio && unsupportedCodec) {
     const hasResult = !!entry.processedUrl;
+    // Single-file results leave processedFilename null; the name is the last
+    // segment of the download URL, as in tool-page.
+    const resultName =
+      entry.processedFilename ??
+      decodeURIComponent(entry.processedUrl?.split("/").pop() || "video");
     return (
       <div className="flex h-full w-full items-center justify-center p-4">
         <NonNativePreview
           file={hasResult ? undefined : entry.file}
           src={hasResult ? (entry.processedUrl ?? undefined) : undefined}
-          filename={
-            hasResult
-              ? (entry.processedFilename ?? entry.file?.name ?? "video")
-              : (entry.file?.name ?? "video")
-          }
+          filename={hasResult ? resultName : (entry.file?.name ?? "video")}
           fileSize={hasResult ? (entry.processedSize ?? null) : (entry.file?.size ?? 0)}
           modality="video"
         />

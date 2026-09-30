@@ -97,6 +97,41 @@ describe("MediaPlayerView transcode fallback (#1503)", () => {
     expect(uploaded.name).toBe("output.ogv");
   });
 
+  it("names a single-file result after its download URL, not the input", async () => {
+    const inputFile = new File(["original-input-bytes"], "input.mp4", { type: "video/mp4" });
+    useFileStore.getState().setFiles([inputFile]);
+    // Single-file runs store the download URL and leave processedFilename null.
+    useFileStore.getState().updateEntry(0, { processedUrl: PROCESSED_URL, processedSize: 9999 });
+
+    const fetchMock = stubFetch(() =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        blob: () => Promise.resolve(new Blob(["processed-ogv-bytes"], { type: "video/ogg" })),
+      }),
+    );
+
+    render(
+      <I18nProvider>
+        <MediaPlayerView />
+      </I18nProvider>,
+    );
+
+    fireEvent.loadedMetadata(screen.getByTestId("media-player-video"));
+    expect(screen.getByText("output.ogv")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /generate preview/i }));
+    await act(async () => {});
+
+    const generateCalls = fetchMock.mock.calls.filter(([url]) =>
+      String(url).endsWith(PREVIEW_GENERATE_URL),
+    );
+    expect(generateCalls).toHaveLength(1);
+    const formData = generateCalls[0][1]?.body as FormData;
+    const uploaded = formData.get("file") as File;
+    expect(uploaded.name).toBe("output.ogv");
+  });
+
   it("previews the input file when no processed result exists", async () => {
     const inputFile = new File(["original-input-bytes"], "input.ogv", { type: "video/ogg" });
     useFileStore.getState().setFiles([inputFile]);
